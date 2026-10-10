@@ -35,11 +35,12 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
 | 9 | Backend config | Config keys only for seams with ≥ 2 production backends (`DETECTOR_BACKEND`, `EJECT_BACKEND`). Notifications are on when `APPRISE_URLS` is set. Everything else is fixed in the patchbay. |
 | 10 | Notifications | [apprise-go](https://pkg.go.dev/github.com/unraid/apprise-go) (`github.com/unraid/apprise-go`, BSD-2), configured with `APPRISE_URLS`. Pushover is `pover://USER_KEY@APP_TOKEN`. |
 | 11 | Fixtures | All three sources: synthetic (marked), mined from public reports (marked with source), and captured on your hardware (authoritative). |
-| 12 | `/config/ripper.sh` | **Hard break.** No longer executed; documented in migration notes only. Per-disc hook scripts stay as the `script` rip backend. |
+| 12 | User scripts | **Hard break.** Neither `/config/ripper.sh` nor the per-disc hooks (`BLURAYrip.sh`, `DVDrip.sh`, `CDrip.sh`, `DATArip.sh`) are executed. New rip behaviour = a new Go backend in the patchbay. Customisation that remains is tool config (`abcde.conf`, `default.mmcp.xml`, MakeMKV `settings.conf`) and env. Post-rip automation goes through an apprise webhook target (`json://`, `form://`). |
 | 13 | Registry | `ghcr.io/jacaudi/docker-ripper` using `GITHUB_TOKEN`. |
 | 14 | Web env names | **New names only**: `WEB_PATH_PREFIX`, `WEB_USERNAME`, `WEB_PASSWORD`. `PREFIX`/`USER`/`PASS` are ignored. |
 | 15 | Upstream | Diverge permanently. Drop upstream-only workflows (sponsor labelling, issue auto-close). |
 | 16 | Deployment target | Target-agnostic binary. Docker/compose is the documented target (see §4); a Kubernetes example uses a device plugin, `replicas: 1`, `strategy: Recreate`. |
+| 17 | API docs | Scalar (`@scalar/api-reference`), self-hosted and embedded in the binary, at `/docs`, in both modes (§6.5). |
 
 ## 3. Principles applied
 
@@ -92,7 +93,7 @@ Docker sends SIGTERM to PID 1 and kills it after a grace period (10 s by default
 | `makemkvcon` (detect, rip, reg) | keep, exec | `detect/makemkv`, `rip/makemkv`, `mkvkey` registration |
 | `abcde` + cdparanoia/lame/flac/eyeD3/metaflac/glyrc | keep, exec | `rip/abcde` |
 | `ddrescue` | keep, exec | `rip/ddrescue` |
-| user hook scripts (`BLURAYrip.sh`, `DVDrip.sh`, `CDrip.sh`, `DATArip.sh`) | keep, exec | `rip/script` (same names, `+x` requirement and arguments as today) |
+| user hook scripts (`BLURAYrip.sh`, `DVDrip.sh`, `CDrip.sh`, `DATArip.sh`) | **remove** | — (a new behaviour is a new backend; external automation via apprise webhooks) |
 | `cdparanoia -Q` | exec now → ioctl later | inside `detect/makemkv` → `detect/native` |
 | `eject`, `sdparm` | exec now → ioctl later | `eject/exec` → `eject/ioctl` |
 | `curl` (Pushover) | replace | `notify/apprise` |
@@ -116,11 +117,12 @@ internal/engine/              poll → detect → rip → finalize → eject →
 internal/output/              dir naming, label sanitising, finished/ move, chown/chmod, partial cleanup
 internal/api/                 huma operations (status, log)
 internal/webui/               embedded static UI (mounted unless headless)
+internal/apidocs/             Scalar API reference + OpenAPI document (vendored, embedded)
 
 seams (interface only)        backends (one package each)
 internal/runner/              runner/exec            (fake in tests)
 internal/detect/              detect/makemkv          detect/native (phase 6)
-internal/rip/                 rip/makemkv  rip/abcde  rip/ddrescue  rip/script
+internal/rip/                 rip/makemkv  rip/abcde  rip/ddrescue
 internal/eject/               eject/exec              eject/ioctl (phase 6)
 internal/notify/              notify/apprise          notify/nop
 internal/mkvkey/              mkvkey/env              mkvkey/forum
@@ -185,10 +187,10 @@ func Build(ctx context.Context, cfg config.Config, p *obs.Providers) (lifecycle.
     }
 
     rippers := map[disc.Kind]rip.Ripper{
-        disc.BluRay:  withHook(cfg, "BLURAYrip.sh", run, makemkv.New(run, cfg.StorageBD, cfg.MinLength)),
-        disc.DVD:     withHook(cfg, "DVDrip.sh", run, makemkv.New(run, cfg.StorageDVD, cfg.MinLength)),
-        disc.AudioCD: withHook(cfg, "CDrip.sh", run, abcde.New(run, cfg.Drive, cfg.AbcdeConf)),
-        disc.Data:    withHook(cfg, "DATArip.sh", run, ddrescue.New(run, cfg.Drive, cfg.StorageData)),
+        disc.BluRay:  makemkv.New(run, cfg.StorageBD, cfg.MinLength),
+        disc.DVD:     makemkv.New(run, cfg.StorageDVD, cfg.MinLength),
+        disc.AudioCD: abcde.New(run, cfg.Drive, cfg.AbcdeConf),
+        disc.Data:    ddrescue.New(run, cfg.Drive, cfg.StorageData),
     }
 
     eng := engine.New(engine.Deps{
@@ -197,6 +199,9 @@ func Build(ctx context.Context, cfg config.Config, p *obs.Providers) (lifecycle.
 
     api := httpapi.New(httpapi.Options{Addr: cfg.APIAddr, Middleware: basicAuth(cfg) /* , ... */})
     apiroutes.Register(api.Huma, eng, cfg.LogFile)
+    if cfg.APIDocs {
+        apidocs.Mount(api) // Scalar at /docs + /openapi.{json,yaml}; see §6.5
+    }
     if !cfg.Headless {
         webui.Mount(api, cfg.WebPathPrefix)
     }
@@ -213,8 +218,7 @@ func Build(ctx context.Context, cfg config.Config, p *obs.Providers) (lifecycle.
 }
 ```
 
-`withHook` returns the `rip/script` backend when `/config/<name>` exists and is executable,
-and the default backend otherwise. Each swap is visible in exactly one function.
+Swapping the backend for a disc kind is one line in this map.
 
 ### 6.4 Commands
 
@@ -227,8 +231,8 @@ and the default backend otherwise. Each swap is visible in exactly one function.
 
 ### 6.5 HTTP surface
 
-The public listener (`API_ADDR`) uses huma, so the OpenAPI spec is generated and its docs
-UI is on by default. Basic auth via `httpapi.Options.Middleware` when `WEB_USERNAME` and
+The public listener (`API_ADDR`) uses huma, so the OpenAPI 3.1 document is generated from
+the Go types. Basic auth via `httpapi.Options.Middleware` when `WEB_USERNAME` and
 `WEB_PASSWORD` are both set (constant-time compare).
 
 | Route | Purpose |
@@ -237,6 +241,27 @@ UI is on by default. Basic auth via `httpapi.Options.Middleware` when `WEB_USERN
 | `GET /api/v1/log?lines=N` | Last N records, newest first, plus file size and a `large` flag. |
 | `DELETE /api/v1/log` | Truncate the log file. |
 | `GET /` … | Web UI (only when not headless), embedded, served via `RawRoute("GET /…")`. |
+
+**API docs — Scalar.** go-service-kit turns off huma's built-in docs route on purpose,
+because huma's renderers (Stoplight Elements, Scalar, Swagger UI) all load from unpkg.com.
+In its place the kit serves a minimal renderer, and it says a service wanting a richer UI
+should self-host one on `API.Mux`. Ripper does exactly that:
+
+- kit `DocsEnabled: false`; `internal/apidocs` serves `GET /openapi.json` and
+  `GET /openapi.yaml` from `api.Huma.OpenAPI()`, plus `GET /docs` and its assets;
+- `@scalar/api-reference` standalone bundle, **pinned** (1.73.x at time of writing),
+  vendored by `make vendor-scalar` (npm tarball + sha256 check), `go:embed`ded, and bumped
+  by Renovate. No CDN, so it works offline. Adds roughly 3–4 MB to the binary;
+- page initialised from a separate `docs-init.js` (no inline script) via
+  `Scalar.createApiReference('#app', {...})` with `url: '/openapi.json'`,
+  `withDefaultFonts: false` (no fonts.scalar.com), `telemetry: false`,
+  `hideTestRequestButton: true` and `hideClientButton: true`. The kit flags a same-origin
+  "try it" console as a CSRF primitive, and with basic auth the browser would replay the
+  credentials, so `DELETE /api/v1/log` is exposed;
+- strict CSP like the kit's (`default-src 'none'; script-src 'self'; connect-src 'self'` …).
+  Whether Scalar needs `style-src 'unsafe-inline'` is checked in phase 2;
+- on in both headless and UI modes (it documents the API, not the UI), behind the same
+  basic auth; `API_DOCS_ENABLED=false` turns it off.
 
 Admin listener (`ADMIN_ADDR`): kit-provided `/healthz`, `/readyz` (registered check: drive
 device present), `/metrics`, pprof when `PPROF_ENABLED=true`. Candidates **not** in scope
@@ -270,7 +295,7 @@ Exit: the parity suite passes against the legacy script for every scenario.
 Exit: `ripper serve` starts, answers `/healthz`, shuts down cleanly on SIGTERM.
 
 ### Phase 2 — HTTP surface
-- `internal/api` (status, log), `internal/webui` (existing assets ported to read JSON
+- `internal/api` (status, log), `internal/apidocs` (Scalar + OpenAPI), `internal/webui` (existing assets ported to read JSON
   records; petite-vue kept), `--headless`, basic-auth middleware, `WEB_PATH_PREFIX`.
 - Risk to verify early: path prefix with huma plus otelhttp route labels. Fallback: register
   operations with the prefix rather than wrapping the handler in `StripPrefix`.
@@ -278,7 +303,7 @@ Exit: `ripper serve` starts, answers `/healthz`, shuts down cleanly on SIGTERM.
 Exit: `httptest` coverage of every route, in both modes, with and without auth and prefix.
 
 ### Phase 3 — Engine and backends (exec)
-- `runner/exec`, `detect/makemkv`, `rip/{makemkv,abcde,ddrescue,script}`, `eject/exec`,
+- `runner/exec`, `detect/makemkv`, `rip/{makemkv,abcde,ddrescue}`, `eject/exec`,
   `notify/{apprise,nop}`, `output`, `engine`, `patchbay`.
 - Engine tests use `testing/synctest` (60 s poll, 5 s manual-eject wait) with
   `lifecycle.Spec.Signals` set to an empty slice, as the kit requires inside a bubble.
@@ -330,11 +355,11 @@ Exit: CI smoke test of the image against a fakebin drive; one real rip per disc 
 | D9 | MakeMKV key printed; `~/.MakeMKV` mode 777 | Key logged redacted; mode 0700 |
 | D10 | Pushover via `POVER_APP_TOKEN`/`POVER_USER_KEY`, fixed text | `APPRISE_URLS` (e.g. `pover://USER_KEY@APP_TOKEN`); success/failure/stopped events |
 | D11 | Basic auth realm "FeedCrawler", non-constant-time | Constant-time, realm "Ripper" |
-| D12 | `/config/ripper.sh` executed | Ignored (hard break); hook scripts remain |
+| D12 | `/config/ripper.sh` and per-disc hook scripts executed | Both ignored (hard break); use a Go backend, or apprise webhooks for external automation |
 | D13 | `useradd`/`groupadd` at start | Numeric chown; names resolved if present, else `FILEUSERID`/`FILEGROUPID` |
 | D14 | `PREFIX`/`USER`/`PASS` | `WEB_PATH_PREFIX`/`WEB_USERNAME`/`WEB_PASSWORD` only |
 | D15 | Plain-text `Ripper.log`, tool output raw | JSON records; tool output one record per line |
-| D16 | `/api/log/` | `/api/v1/log`, `/api/v1/status`; OpenAPI docs |
+| D16 | `/api/log/` | `/api/v1/log`, `/api/v1/status`; OpenAPI 3.1 at `/openapi.json`, Scalar docs at `/docs` |
 | D17 | One port (9090) | API/UI `:9090`, admin `:9091` |
 | D18 | `docker stop` kills a rip, leaving partial output | Rip cancelled cleanly, partial output removed |
 | D19 | phusion base, python, syslog-ng in image | `ubuntu:noble` + tools + tini + `ripper` |
@@ -356,7 +381,6 @@ a scenario directory (`FAKEBIN_DIR`):
 - simulates side effects (MKV/ISO/FLAC files written into the output directory);
 - with `<tool>.block`, blocks until signalled, to test cancel-mid-rip cleanup.
 
-Hook scripts are tested with real tiny shell scripts in `testdata/hooks/`.
 
 ### 9.3 Parity — legacy vs Go
 Every scenario runs twice in a throwaway container (root, real `/config`, `/out`):
@@ -381,11 +405,8 @@ disc, eject, a short ISO read. Gates the phase 6 backends. Never runs in CI.
 
 ## 11. Remaining open points
 
-- **Hook scripts**: assumed to stay (D12 only drops `ripper.sh`). Confirm.
 - **apprise-go maturity**: pre-1.0 and not every target is tested upstream. The seam keeps
   it swappable; re-evaluate at phase 3.
-- **go-service-template**: its spec lives on an internal GitLab I can't reach. If the
-  layout above should mirror it, share the relevant parts.
 
 ## References
 
