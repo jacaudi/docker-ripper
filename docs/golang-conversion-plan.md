@@ -13,6 +13,7 @@ making design decisions**.
 | this file | goal, decisions, glossary, rules, deployment, behaviour changes | understand *why* and what's forbidden |
 | [`plan/contracts.md`](plan/contracts.md) | config table, exact Go types/interfaces, behaviour tables, HTTP routes, CSP, primitives | copy names, signatures and values |
 | [`plan/testing.md`](plan/testing.md) | test layers, fixture format, fakebin protocol, parity scenarios | write tests |
+| [`plan/tooling.md`](plan/tooling.md) | taskfile, lint/static-analysis config, security scanning, Conventional Commits, release-please, Renovate, workflows | set up and run quality gates and releases |
 | [`plan/phases.md`](plan/phases.md) | numbered tasks with files, steps and "done when" commands | do the work, in order |
 
 When something you need is not specified, **stop and ask**. Do not invent behaviour.
@@ -54,6 +55,9 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
 | 17 | API docs | Scalar 1.73.1, vendored + embedded, at `/docs`; OpenAPI at `/openapi.json`. |
 | 18 | Web UI | **React 19 + Ant Design 6** (Vite 8, TypeScript 5.9), built into `internal/webui/dist` and embedded; typed client generated from huma's OpenAPI. |
 | 19 | Go version | **Go 1.27** (`go 1.27.0`, `toolchain go1.27.2`), the latest stable as of 2026-10-10. |
+| 20 | Task runner | **Task** v3.54 with a lowercase `taskfile.yml` at the root; no Makefile; CI calls the same tasks. |
+| 21 | Quality gates | golangci-lint v2.14 (standard set + bug/security/idiom linters, `modernize`, gofumpt/goimports), `go mod tidy -diff`/`verify`, govulncheck, OSV-Scanner, CodeQL, Trivy, OpenSSF Scorecard, SHA-pinned actions, signed images with SBOM + provenance. |
+| 22 | Releases | **release-please** (manifest mode, release-type `go`, Conventional Commits, GitHub App token); images published from the release workflow. |
 
 ## 3. Glossary
 
@@ -70,7 +74,7 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
 - **fakebin**: the fake external-tools binary used in tests (T§3).
 - **Fixture**: captured or synthetic tool output plus expectations (T§2).
 - **Scenario**: one parity test case (T§4.1).
-- **C§n / T§n**: section n of `contracts.md` / `testing.md`.
+- **C§n / T§n / L§n**: section n of `contracts.md` / `testing.md` / `tooling.md`.
 
 ## 4. Rules (do / do not)
 
@@ -85,7 +89,8 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
   - `t.Context()`, `t.Attr`;
   - `context.WithoutCancel` for cleanup;
   - `debug.ReadBuildInfo` for the version.
-- Run `make lint test vulncheck modernize` before every commit; `make parity` before every PR from phase 3.
+- Run `task check` before every commit; `task parity` before every PR from phase 3.
+- Use Conventional Commit messages and PR titles (L§4).
 - Keep every seam interface at 1–2 methods. Add a compile-time assertion in each backend.
 - Wrap errors with `%w` and context (`fmt.Errorf("abcde rip: %w", err)`).
 
@@ -95,6 +100,7 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
 - Use `http.StripPrefix` (or anything that clones the request) as listener middleware.
 - Use `cmd.StdoutPipe` with `cmd.Run`/`Wait`.
 - Use `-ldflags -X` for the version.
+- Add a `Makefile`, or run a check in CI that isn't a `task`.
 - Use `encoding/json/v2` (still behind `GOEXPERIMENT` in 1.27).
 - Use `synctest` around real processes or real listeners.
 - Log the MakeMKV key (except via `obs.RedactAttr`), apprise URLs, or basic-auth credentials.
@@ -189,17 +195,26 @@ cobra v1.10.2, viper v1.21.0, go-service-kit v0.3.0, apprise-go v0.3.3 (exact; p
 - Protect `archive`: Settings → Rules → Rulesets → New branch ruleset → target `archive`;
   enable *Restrict deletions*, *Block force pushes*, *Restrict updates*.
 - ghcr publishing needs `permissions: packages: write` in the workflow; nothing else.
+- Create a GitHub App for release-please (contents + pull-requests: write), install it on the repo,
+  and add the secrets `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY` (L§5).
+- Settings → General: allow squash merging only, with the PR title as the default commit message.
+- Settings → Actions → General: allow GitHub Actions to create and approve pull requests.
+- Branch protection on `main`: require `ci` jobs, `security` CodeQL, and a linear history.
 
 ## 10. Remaining risks
 
 - **apprise-go** is pre-1.0 and not every target is tested upstream. It sits behind the
   `Notifier` seam; re-evaluate at phase 3.
-- **golangci-lint vs Go 1.27**: the go-service-kit pin may predate 1.27 (checked in P0.1).
+- **golangci-lint vs Go 1.27**: verified that v2.14.0 built with go1.27.2 accepts our config. `task tools`
+  builds it from source with the repo toolchain for exactly this reason.
 - **DVD/BD data-disc detection** has no known MakeMKV signal; it waits for hardware fixtures (phase 6).
 
 ## References
 
 - go-service-kit: https://github.com/leftathome/go-service-kit
+- Task: https://taskfile.dev · golangci-lint: https://golangci-lint.run · govulncheck: https://go.dev/doc/security/vuln/
+- release-please action: https://github.com/googleapis/release-please-action · Conventional Commits: https://www.conventionalcommits.org
+- OSV-Scanner: https://google.github.io/osv-scanner/ · OpenSSF Scorecard: https://github.com/ossf/scorecard · Trivy: https://trivy.dev
 - apprise-go: https://pkg.go.dev/github.com/unraid/apprise-go · https://unraid.net/blog/apprise-go
 - Scalar configuration: https://github.com/scalar/scalar/blob/main/documentation/configuration.md
 - Go module layout: https://go.dev/doc/modules/layout

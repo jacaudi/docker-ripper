@@ -3,10 +3,10 @@
 ## How to execute
 
 - Do tasks **in order**. Each task lists **Files**, **Do**, **Test**, and **Done when**.
-- A task is done only when its "Done when" command exits 0. Commit after every task with the
-  message `P<phase>.<n>: <task title>`.
-- Contracts live in [`contracts.md`](contracts.md) (cited as C§n) and tests in
-  [`testing.md`](testing.md) (cited as T§n). Copy names and values from there exactly.
+- A task is done only when its "Done when" command exits 0. Commit after every task with a
+  Conventional Commit message: `<type>(<package>): <summary> (P<phase>.<n>)` (tooling.md §4).
+- Contracts live in [`contracts.md`](contracts.md) (cited as C§n), tests in
+  [`testing.md`](testing.md) (T§n) and tooling in [`tooling.md`](tooling.md) (L§n). Copy names and values from there exactly.
 - If a task needs a decision that isn't written down, **stop and ask**; do not guess.
 - One PR per phase. CI must be green before the next phase starts.
 
@@ -27,25 +27,33 @@ Pinned versions (Renovate keeps them current afterwards):
 | eslint / typescript-eslint / eslint-plugin-react-hooks | 10.12.0 / latest compatible |
 | openapi-typescript / openapi-fetch | 7.13.0 / 0.17.0 |
 | @scalar/api-reference | 1.73.1 |
+| Task | v3.54.0 |
+| golangci-lint | v2.14.0 (built from source by `task tools`) |
+| govulncheck | v1.8.0 |
+| GitHub Actions | current major, pinned by commit SHA (L§3) |
 
 ---
 
 ## Phase 0 — Safety net
 
 **P0.1 Go module and tooling**
-- Files: `go.mod`, `Makefile`, `.golangci.yml`, `renovate.json`, `.gitignore` (append), `.dockerignore`.
+- Files: `go.mod`, `taskfile.yml`, `.golangci.yml`, `renovate.json`, `.gitignore` (append), `.dockerignore`.
 - Do:
   - `go mod init github.com/jacaudi/docker-ripper`; set `go 1.27.0` and `toolchain go1.27.2`.
-  - Copy `.golangci.yml` and the Makefile structure from go-service-kit (pinned tool installs
-    through `scripts/retry.sh`, verdicts never retried). Copy `scripts/retry.sh` too.
-  - Targets: `help lint test vulncheck modernize parity ui-deps ui-gen ui-lint ui-test ui vendor-scalar build image`.
-    `modernize` = `go fix -diff ./...` and fails if the output isn't empty. `test` =
-    `go test -race -shuffle=on ./...`. `build` depends on `ui`.
-  - **Check that the pinned golangci-lint release is built with Go ≥ 1.27** (`golangci-lint version`).
-    If it isn't, pin the newest release that is.
+  - Copy `taskfile.yml`, `.golangci.yml` and `renovate.json` **exactly** from tooling.md §1, §2, §6.
+    Delete any `Makefile`.
   - `.gitignore`: `internal/webui/dist/*`, `!internal/webui/dist/.gitkeep`, `web/node_modules/`, `bin/`.
   - `.dockerignore`: `web/node_modules`, `bin`. Do **not** ignore `.git` (C§6.2).
-- Done when: `make lint test` exits 0 (nothing to test yet).
+- Done when: `task tools && task lint test vuln` exits 0 (nothing to test yet) and
+  `bin/golangci-lint version` says `built with go1.27`.
+
+**P0.1a Releases and commit conventions**
+- Files: `release-please-config.json`, `.release-please-manifest.json`, `.github/workflows/release.yml`,
+  `.github/pull_request_template.md` (checklist: conventional title, `task check` run, deviations noted).
+- Do: tooling.md §4 and §5. `release.yml` contains the `release-please` job only; `publish` is added in P5.3.
+- Manual (owner): create the GitHub App, add `RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY`, enable
+  squash-only merges with the PR title as the commit message (main plan §9).
+- Done when: after merge, release-please opens a release PR.
 
 **P0.2 Synthetic DRV fixtures**
 - Files: `internal/disc/testdata/drv/<case>.{txt,json}` for every required case in T§2.
@@ -80,14 +88,14 @@ Pinned versions (Renovate keeps them current afterwards):
 - Do: implement T§4 with the legacy run only. Get `ripper.sh` with
   `git show archive:root/ripper/ripper.sh`. Scenarios: every T§4.1 row except `cancel_mid_rip`.
   The assertions encode the **legacy** column.
-- Done when: `make parity` passes.
+- Done when: `task parity` passes.
 
-**P0.7 CI**
-- Files: `.github/workflows/ci.yml`.
-- Do: on `pull_request` and push to `main`: job `go` (`actions/setup-go` with
-  `go-version-file: go.mod`; `make lint test vulncheck modernize`); job `parity` (`make parity`).
-  `permissions: contents: read`.
-- Done when: the PR is green.
+**P0.7 CI and security workflows**
+- Files: `.github/workflows/ci.yml`, `.github/workflows/security.yml`.
+- Do: tooling.md §3 and §7. In phase 0, `ci.yml` has jobs `pr-title`, `go`, `parity`; the `ui` and
+  `image` jobs are added in P2.4 and P5.3. `security.yml` is complete (CodeQL go now;
+  `javascript-typescript` is added in P2.4).
+- Done when: the PR is green and the CodeQL/OSV/Scorecard results appear under Security → Code scanning.
 
 ---
 
@@ -130,7 +138,7 @@ Done when: `go build ./cmd/ripper && ./ripper version`.
 - Test: mode table (C§5.4); sanitise table (`"Movie: Part 1/2"` → `"Movie_ Part 1_2"`, `".."` → `disc_<ts>`,
   `""` → `disc_<ts>`); collision suffixes; staging for AudioCD; `Finalize` with/without separate-finish;
   traversal attempt `../../etc` stays inside the root.
-- Done when: `make test modernize lint` passes.
+- Done when: `task lint test` passes.
 
 ---
 
@@ -166,7 +174,8 @@ wrong → 401; right → 200; disabled when either is empty. Done when: tests pa
   `web/eslint.config.js` (flat; typescript-eslint + react-hooks), `web/index.html` (contains
   `<meta name="csp-nonce" content="__CSP_NONCE__">`, `<div id="root">`), `internal/webui/dist/.gitkeep`.
 - Do: `"gen": "openapi-typescript ../internal/api/testdata/openapi.json -o src/api/schema.d.ts"`; commit `schema.d.ts`.
-- Done when: `make ui-deps ui-gen ui-lint` passes and `git diff --exit-code web/src/api/schema.d.ts` is clean.
+- Also add the `ui` job to `ci.yml` and `javascript-typescript` to CodeQL (L§7).
+- Done when: `task ui:gen ui:lint` passes and `git diff --exit-code web/src/api/schema.d.ts` is clean.
 
 **P2.5 Frontend app**
 - Files (`web/src/`):
@@ -190,7 +199,7 @@ wrong → 401; right → 200; disabled when either is empty. Done when: tests pa
 - Test (vitest + jsdom + testing-library, `fetch` mocked with `vi.fn`): StatusCard renders a tag
   for each state; LogPanel renders a parsed row and a raw row and the large alert; ClearLogButton
   sends DELETE and then GET.
-- Done when: `make ui-lint ui-test ui` passes and `internal/webui/dist/index.html` exists.
+- Done when: `task ui:lint ui:test ui:build` passes and `internal/webui/dist/index.html` exists.
 
 **P2.6 `internal/webui`**
 - Files: `webui.go` (`//go:embed all:dist`; `Mount(api *httpapi.API, prefix string) error`), tests.
@@ -198,12 +207,12 @@ wrong → 401; right → 200; disabled when either is empty. Done when: tests pa
   `dist/index.html` is missing (so `serve` without `--headless` fails loudly).
 - Test: `/` 200, CSP contains `nonce-` matching the meta tag; an asset has immutable caching;
   prefix `/ripper` works and `/ripper` → 301 `/ripper/`; a missing dist returns an error.
-- Done when: `make ui test` passes.
+- Done when: `task ui:build test` passes.
 
 **P2.7 Wire HTTP into the patchbay** — the API listener with `httpapi.New` options from C§4.1,
 `api.Register`, `apidocs.Mount` if docs, `webui.Mount` unless headless, root redirects. The engine is
 still absent: StatusSource returns `{state: "idle"}`. Test: patchbay test hits each route in both
-modes. Done when: `make lint test modernize` passes.
+modes. Done when: `task check` passes.
 
 ---
 
@@ -245,9 +254,9 @@ as a `lifecycle.Worker{Name: "engine", Run: eng.Run, FinishCurrentCycle: true, S
 in `Spec`. StatusSource = the engine.
 
 **P3.9 Parity, Go side** — extend the harness with the Go run (T§4) and add `cancel_mid_rip`.
-Done when: `make parity` passes with every deviation declared.
+Done when: `task parity` passes with every deviation declared.
 
-Phase done when: `make lint test vulncheck modernize parity` passes.
+Phase done when: `task check parity` passes.
 
 ---
 
@@ -275,7 +284,7 @@ Test: override file wins; the default is written once.
 
 **P4.4 Removed-variable warnings** — C§1.2 list. Test: a WARN for each set var; none when unset.
 
-Phase done when: `make lint test vulncheck modernize parity` passes.
+Phase done when: `task check parity` passes.
 
 ---
 
@@ -320,16 +329,15 @@ CMD ["serve"]
 moved in P4.3).
 
 **P5.3 Workflows**
-- `ci.yml` adds jobs `ui` (setup-node 24, `cache: npm`, `cache-dependency-path: web/package-lock.json`;
-  `make ui-deps ui-gen ui-lint ui-test` + `git diff --exit-code web/src/api/schema.d.ts`) and
-  `image` (build both Dockerfiles, no push, smoke test: `docker run --rm image version`).
-- New `publish.yml`: on push to `main` and tags `v*`; `permissions: contents: read, packages: write`;
-  `docker/login-action` to `ghcr.io` with `GITHUB_TOKEN`; buildx multi-arch (amd64+arm64 for
-  `latest/`, amd64 for `manual-build/`); tags `latest`, `ppa-latest`, `manual-latest`, `sha-<short>`,
-  semver on tags; GHA cache.
-- Delete `BuildImages.yml`, `IssueModerator.yml`, `LabelSponsors.yml`, `UpdateOnBaseImageChange.yml`
-  and `ManualBuildOnBetaRelease.yml`. Renovate handles base images; a scheduled `publish.yml`
-  run (weekly) rebuilds for new MakeMKV.
+- `ci.yml`: add the `image` job (build both Dockerfiles, no push; Trivy per L§3; smoke test
+  `docker run --rm <image> version`).
+- `release.yml`: add the `publish` job per L§5 (checkout at the tag with `fetch-depth: 0`, buildx
+  multi-arch with `provenance: mode=max` + `sbom: true`, Trivy, push the L§5 tags, cosign sign).
+- New `rebuild.yml` per L§5.
+- Delete `BuildImages.yml`, `IssueModerator.yml`, `LabelSponsors.yml`, `UpdateOnBaseImageChange.yml`,
+  `ManualBuildOnBetaRelease.yml`.
+- This PR's title: `feat!: replace bash/python implementation with the Go ripper`, with a
+  `BREAKING CHANGE:` footer linking the migration notes.
 
 **P5.4 Docs** — README rewrite: config table (C§1.2), the removed-vars list, migration notes
 (main plan §8), compose:

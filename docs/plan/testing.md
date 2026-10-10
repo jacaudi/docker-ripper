@@ -4,9 +4,9 @@ Four layers, cheapest first. Layers 1–3 run in CI; layer 4 needs a real drive.
 
 | Layer | What | Where | Command |
 |---|---|---|---|
-| 1 Unit | pure functions; seams faked in memory; engine under `synctest` | `*_test.go` next to code | `make test` |
-| 2 Integration | real processes via **fakebin** on `PATH` | `internal/.../*_test.go` with `TestMain` building fakebin | `make test` |
-| 3 Parity | legacy `ripper.sh` vs `ripper serve` against the same fakebin, in a container | `test/parity/` (build tag `parity`) | `make parity` |
+| 1 Unit | pure functions; seams faked in memory; engine under `synctest` | `*_test.go` next to code | `task test` |
+| 2 Integration | real processes via **fakebin** on `PATH` | `internal/.../*_test.go` with `TestMain` building fakebin | `task test` |
+| 3 Parity | legacy `ripper.sh` vs `ripper serve` against the same fakebin, in a container | `test/parity/` (build tag `parity`) | `task parity` |
 | 4 Hardware | real drive | build tag `hardware` | `RIPPER_TEST_DRIVE=/dev/sr0 go test -tags hardware ./...` |
 
 ## 1. Rules
@@ -95,7 +95,7 @@ fakebin applies `creates` only for a `makemkvcon` call whose args contain `mkv`,
   `archive` branch (checked by a test comparing its sha256 against `test/parity/legacy/SHA256`).
   fakebin is linked into `/usr/local/bin` for each tool **and at `/usr/bin/abcde`** (the legacy
   script calls that absolute path).
-- `make parity` builds the image and runs `go test -tags parity ./test/parity/...` inside it as root.
+- `task parity` builds the image and runs `go test -tags parity ./test/parity/...` inside it as root.
 - Each scenario: fresh `/config`, `/out`, `$FAKEBIN_DIR`.
   - **Legacy run:** `sleep.max=2`, env from the scenario, `bash /legacy/ripper.sh`, timeout 60 s.
   - **Go run:** same fakebin files and env plus `POLL_INTERVAL=1s` and `HEADLESS=true`. Start
