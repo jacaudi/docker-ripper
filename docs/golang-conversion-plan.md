@@ -1,34 +1,37 @@
 # Go conversion plan
 
-Status: **agreed, v3 (executable)** · Baseline: `archive` branch (= `main` @ `21c5796`) ·
+Status: **agreed, v4 (executable, simplified)** · Baseline: `archive` branch (= `main` @ `21c5796`) ·
 Background: [`.claude/CLAUDE.md`](../.claude/CLAUDE.md)
 
 ## How to use this plan
 
-This plan is written so that an executor (human or a smaller model) can carry it out **without
+The plan is written so that an executor (a human or a smaller model) can carry it out **without
 making design decisions**.
 
 | File | Contains | Use it to |
 |---|---|---|
-| this file | goal, decisions, glossary, rules, deployment, behaviour changes | understand *why* and what's forbidden |
-| [`plan/contracts.md`](plan/contracts.md) | config table, exact Go types/interfaces, behaviour tables, HTTP routes, CSP, primitives | copy names, signatures and values |
-| [`plan/testing.md`](plan/testing.md) | test layers, fixture format, fakebin protocol, parity scenarios | write tests |
-| [`plan/tooling.md`](plan/tooling.md) | taskfile, lint/static-analysis config, security scanning, Conventional Commits, release-please, Renovate, workflows | set up and run quality gates and releases |
+| this file | goal, decisions, glossary, rules, deployment, migration notes | understand *why* and what's forbidden |
+| [`plan/contracts.md`](plan/contracts.md) | config table, exact Go types and interfaces, behaviour tables, HTTP routes, CSP, primitives | copy names, signatures and values |
+| [`plan/testing.md`](plan/testing.md) | test layers, fixtures, fakebin protocol, end-to-end smoke scenarios | write tests |
+| [`plan/tooling.md`](plan/tooling.md) | taskfile, lint/static analysis, security scanning, Conventional Commits, release-please, Renovate, workflows | set up quality gates and releases |
 | [`plan/phases.md`](plan/phases.md) | numbered tasks with files, steps and "done when" commands | do the work, in order |
 
-When something you need is not specified, **stop and ask**. Do not invent behaviour.
+If something you need is not specified, **stop and ask**. Do not invent behaviour.
 
 ## 1. Goal
 
-Replace the bash ripper, the init script and the Python web UI with one Go binary, `ripper`,
-that runs as a **headless API service** (`ripper serve --headless`) or as **API + web UI**
-(`ripper serve`).
-- External tools that can't reasonably be replaced (MakeMKV, abcde, ddrescue) sit behind seams
-  and are tested against fake binaries.
-- Everything else becomes Go or a library.
-- Known legacy bugs are fixed on purpose and listed in §8.
+Replace the bash ripper, the init script and the Python web UI with one Go binary, `ripper`.
+It runs either as a **headless API service** (`ripper serve --headless`) or as **API + web UI**
+(`ripper serve`), and rips discs reliably without anyone watching.
 
-This fork **diverges from upstream permanently**.
+The conversion is **not 1-to-1**. What carries over unchanged:
+- the tool command lines;
+- the MakeMKV `DRV:` truth table and the cdparanoia audio-CD fallback;
+- the output folder names;
+- the eject → sdparm fallback.
+
+Configuration, logging, the API, the UI and the error handling are redesigned. This fork
+**diverges from upstream permanently**.
 
 Out of scope: multi-drive support, new output formats, re-implementing abcde's audio pipeline.
 
@@ -36,87 +39,89 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
 
 | # | Topic | Decision |
 |---|---|---|
-| 1 | Seam / Patchbay | One interface per capability (seam); one or more backends per seam, each its own package; `internal/patchbay` is the only place that selects backends. |
+| 1 | Seam / Patchbay | One interface per capability (5 seams: runner, detect, rip, eject, notify). Backends are separate packages. `internal/patchbay` is the only place that selects them. |
 | 2 | Entrypoint | `cmd/ripper/main.go` → `internal/cli` (cobra). Follows [go.dev module layout](https://go.dev/doc/modules/layout). |
-| 3 | Config | **viper only**, confined to `internal/cli`, decoded into `config.Config` with `Validate()` (C§1). |
+| 3 | Config | **viper only**, confined to `internal/cli`. A clean `RIPPER_*` set of 19 keys (C§1); no legacy names. |
 | 4 | Service framework | go-service-kit v0.3.0: `lifecycle`, `obs`, `httpapi`, `outbound`. |
-| 5 | Modes | `ripper serve` = engine + API (+ web UI unless `--headless`). |
-| 6 | Ports | API (+UI, +docs) `:9090`; admin (`/healthz`, `/readyz`, `/metrics`, pprof) `:9091`. |
-| 7 | Logging | One JSON stream to stdout, teed to `LOG_FILE`; tool output one record per line. |
-| 8 | Shutdown mid-rip | Cancel the tool's process group, delete partial output, no eject, notify "stopped". |
-| 9 | Backend config | Only `DETECTOR_BACKEND` and `EJECT_BACKEND`; notifications on iff `APPRISE_URLS` set. |
-| 10 | Notifications | apprise-go v0.3.3 (`github.com/unraid/apprise-go`). |
-| 11 | Fixtures | Synthetic + public (attributed) + hardware (authoritative). |
-| 12 | User scripts | **Removed**: `/config/ripper.sh` and the per-disc hooks. New behaviour = new backend; external automation = apprise webhook targets. |
-| 13 | Registry | `ghcr.io/jacaudi/docker-ripper` via `GITHUB_TOKEN`. |
-| 14 | Web env names | `WEB_PATH_PREFIX`, `WEB_USERNAME`, `WEB_PASSWORD` only. |
+| 5 | Modes | `ripper serve` = engine + API + docs, plus the web UI unless `--headless`. |
+| 6 | Ports | API, UI and docs on `:9090`; admin (`/healthz`, `/readyz`, `/metrics`) on `:9091`. |
+| 7 | Logging | JSON to stdout (the durable log), plus an in-memory ring of the last 2000 records for `GET /api/v1/log`. No log file. |
+| 8 | Shutdown mid-rip | Cancel the tool's process group, delete the staging dir, no eject, notify "stopped". |
+| 9 | Backend config | None. One production backend per seam; swapping one is a patchbay change. |
+| 10 | Notifications | apprise-go v0.3.3; also the hook for automation after a rip (`json://`, `form://`). |
+| 11 | Fixtures | Plain `.txt` files plus an expectation table. `ripper detect --raw` hardware captures replace the synthetic ones. |
+| 12 | User scripts | Removed (`/config/ripper.sh` and the per-disc hooks). |
+| 13 | Registry | `ghcr.io/jacaudi/docker-ripper`. |
+| 14 | Web settings | `RIPPER_WEB_PATH_PREFIX`, `RIPPER_WEB_USERNAME`, `RIPPER_WEB_PASSWORD`. |
 | 15 | Upstream | Diverge permanently; drop upstream-only workflows. |
-| 16 | Deployment | Target-agnostic binary; Docker/compose documented; k8s example with a device plugin. |
-| 17 | API docs | Scalar 1.73.1, vendored + embedded, at `/docs`; OpenAPI at `/openapi.json`. |
-| 18 | Web UI | **React 19 + Ant Design 6** (Vite 8, TypeScript 5.9), built into `internal/webui/dist` and embedded; typed client generated from huma's OpenAPI. |
-| 19 | Go version | **Go 1.27** (`go 1.27.0`, `toolchain go1.27.2`), the latest stable as of 2026-10-10. |
-| 20 | Task runner | **Task** v3.54 with a lowercase `taskfile.yml` at the root; no Makefile; CI calls the same tasks. |
-| 21 | Quality gates | golangci-lint v2.14 (standard set + bug/security/idiom linters, `modernize`, gofumpt/goimports), `go mod tidy -diff`/`verify`, govulncheck, OSV-Scanner, CodeQL, Trivy, OpenSSF Scorecard, SHA-pinned actions, signed images with SBOM + provenance. |
-| 22 | Releases | **release-please** (manifest mode, release-type `go`, Conventional Commits, GitHub App token); images published from the release workflow. |
+| 16 | Deployment | Target-agnostic binary. Docker/compose is documented; there is also a k8s example with a device plugin. |
+| 17 | API docs | Scalar 1.73.1, vendored and embedded, at `/docs` (always on). OpenAPI at `/openapi.json`. |
+| 18 | Web UI | React 19 + Ant Design 6 (Vite 8, TypeScript 5.9): a status card and a log panel, embedded. Typed client generated from huma's OpenAPI. |
+| 19 | Go version | Go 1.27 (`go 1.27.0`, `toolchain go1.27.2`). |
+| 20 | Task runner | Task v3.54, lowercase `taskfile.yml`. No Makefile. CI calls the same tasks. |
+| 21 | Quality gates | golangci-lint v2.14, govulncheck, OSV-Scanner, CodeQL, Trivy, OpenSSF Scorecard; SHA-pinned actions; signed images with SBOM + provenance (L§2–3). |
+| 22 | Releases | release-please (manifest, release type `go`, Conventional Commits, GitHub App token). Images publish from the release workflow. |
+| 23 | Verification | A behaviour spec plus Go tests (unit, fakebin integration, end-to-end smoke). **No legacy parity harness.** Hardware acceptance at cutover. |
+| 24 | Bad drive replies | After 5 in a row `/readyz` fails and one Failure notification is sent. No eject, no exit; the engine keeps polling. |
+| 25 | Re-rip protection | After any rip attempt the engine waits for the disc to be removed. It never re-rips the same disc. |
+| 26 | Staging | Every rip goes into `<kind>/.staging/…` and is renamed into place on success; staging is cleaned at start. |
+| 27 | Native ioctl backends | Future note only (phases.md "Future"). |
 
 ## 3. Glossary
 
-- **Seam**: an interface for one capability: `runner.Runner`, `detect.Detector`, `rip.Ripper`,
-  `eject.Ejector`, `notify.Notifier`, `mkvkey.Source` (C§2.2).
+- **Seam**: the interface for one capability: `runner.Runner`, `detect.Detector`, `rip.Ripper`,
+  `eject.Ejector`, `notify.Notifier` (C§2.2).
 - **Backend**: one package implementing a seam, e.g. `rip/abcde` (C§2.3).
-- **Patchbay**: `internal/patchbay`; `Backends(...)` picks backends, `Spec(...)` assembles the
-  HTTP servers and the `lifecycle.Spec`.
-- **Engine**: `internal/engine`; the poll → detect → rip → finalize → eject → notify loop; a
+- **Patchbay**: `internal/patchbay`. `Backends(...)` picks the backends; `Spec(...)` assembles the
+  HTTP servers, readiness and the `lifecycle.Spec`.
+- **Engine**: `internal/engine`, the detect → rip → finalize → eject → notify loop. It runs as a
   `lifecycle.Worker`.
 - **Pass**: one iteration of the engine loop (C§3.3).
-- **Rip plan**: the ordered rip steps for a (mode, kind) pair (C§3.4).
-- **State / Kind**: drive state and disc kind enums (C§2.1); **engine state**: C§2.4.
+- **Rip plan**: the ordered rip steps for an (ISO mode, kind) pair (C§3.4).
+- **Kind dir**: `BluRay`, `DVD`, `CD` or `DATA` under `RIPPER_OUTPUT_DIR`.
+- **Staging dir**: `<kind dir>/.staging/<ts>/<name>`, where a rip writes before it is finalized (C§3.5).
+- **Awaiting removal**: the engine state after a rip attempt, until the drive reports empty or open.
 - **fakebin**: the fake external-tools binary used in tests (T§3).
-- **Fixture**: captured or synthetic tool output plus expectations (T§2).
-- **Scenario**: one parity test case (T§4.1).
 - **C§n / T§n / L§n**: section n of `contracts.md` / `testing.md` / `tooling.md`.
 
-## 4. Rules (do / do not)
+## 4. Rules
 
 **Do**
 - Use Go 1.27 primitives where they fit:
-  - `os.Root` for every storage-root file operation;
-  - `errors.AsType`;
-  - `strings.Lines`;
-  - `sync.WaitGroup.Go`;
-  - `http.CrossOriginProtection`;
+  - `os.Root` for every output-dir file operation;
+  - `errors.AsType`, `strings.Lines`, `sync.WaitGroup.Go`, `http.CrossOriginProtection`;
   - `testing/synctest` with `synctest.Sleep`;
-  - `t.Context()`, `t.Attr`;
+  - `t.Context()`;
   - `context.WithoutCancel` for cleanup;
   - `debug.ReadBuildInfo` for the version.
-- Run `task check` before every commit; `task parity` before every PR from phase 3.
+- Run `task lint test vuln` before every commit (`task check` once `web/` exists).
 - Use Conventional Commit messages and PR titles (L§4).
-- Keep every seam interface at 1–2 methods. Add a compile-time assertion in each backend.
-- Wrap errors with `%w` and context (`fmt.Errorf("abcde rip: %w", err)`).
+- Keep seams at 1–2 methods, with a compile-time assertion in every backend.
+- Wrap errors with `%w` and context, e.g. `fmt.Errorf("abcde rip: %w", err)`.
 
 **Do not**
-- Import viper or cobra outside `internal/cli`. Use package-level viper. Use `AutomaticEnv`.
-- Use package-level mutable state anywhere.
-- Use `http.StripPrefix` (or anything that clones the request) as listener middleware.
-- Use `cmd.StdoutPipe` with `cmd.Run`/`Wait`.
-- Use `-ldflags -X` for the version.
-- Add a `Makefile`, or run a check in CI that isn't a `task`.
-- Use `encoding/json/v2` (still behind `GOEXPERIMENT` in 1.27).
-- Use `synctest` around real processes or real listeners.
-- Log the MakeMKV key (except via `obs.RedactAttr`), apprise URLs, or basic-auth credentials.
-- Execute any user-supplied script. Call `useradd`/`groupadd`.
-- Load anything from a CDN at runtime (UI, docs, fonts).
-- Add config keys, endpoints or backends that aren't in `contracts.md`.
+- Do not import viper or cobra outside `internal/cli`.
+- Do not use the package-level viper instance, and do not call `v.AutomaticEnv()`.
+- Do not keep package-level mutable state.
+- Do not use `http.StripPrefix`, or anything else that clones the request, as listener middleware.
+- Do not use `cmd.StdoutPipe` with `cmd.Run`/`Wait`.
+- Do not log argv, the MakeMKV key, apprise URLs or the web password.
+- Do not use `-ldflags -X` for the version. Do not use `encoding/json/v2`.
+- Do not use `synctest` around real processes or listeners.
+- Do not execute user-supplied scripts. Do not call `useradd`/`groupadd`.
+- Do not load anything from a CDN at runtime.
+- Do not add config keys, endpoints, backends or seams that aren't in `contracts.md`.
+- Do not add a `Makefile`, or run a check in CI that isn't a `task`.
 
 ## 5. Principles applied
 
 | Principle | Concretely |
 |---|---|
-| KISS | One binary, one engine loop, one log stream, no router in the UI. |
-| YAGNI | Config keys only where contracts list them; native backends only after hardware tests; no build tag for headless. |
-| DRY | One `rip.Ripper` interface for every kind; the engine owns output dirs; the TS API types are generated from the Go types. |
-| SOLID | Small seams (ISP); substitutable backends (LSP); new backend = new package + one patchbay case (OCP); the engine depends only on seams (DIP); patchbay split into `Backends` and `Spec` (SRP). |
-| 12-Factor | Env config (+ one flag); JSON logs to stdout. The `LOG_FILE` tee is a deliberate exception for the UI. Port binding via env; kit `lifecycle` for disposability; one-off admin commands (`detect`, `healthcheck`). |
+| KISS | One binary, one engine loop, one output root, one log stream, a UI with no router. |
+| YAGNI | 19 config keys; no backend switches; no parity harness; no log file; native ioctl deferred. |
+| DRY | One `rip.Ripper` interface and one staging/finalize path for every kind; TS types generated from the Go types; CI calls the tasks. |
+| SOLID | 5 small seams; substitutable backends; new backend = new package + one patchbay line; the engine depends only on seams; patchbay split into `Backends` and `Spec`. |
+| 12-Factor | Env config (+ one flag); logs to stdout; port binding via env; kit `lifecycle` for disposability; admin one-offs (`detect`, `healthcheck`). |
 
 ## 6. Deployment and runtime
 
@@ -124,99 +129,125 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
   - Docker: `--device /dev/srN --device /dev/sgN`.
   - Kubernetes: a device-plugin DaemonSet ([generic-device-plugin](https://github.com/squat/generic-device-plugin/issues/62),
     [Talos guide](https://docs.siderolabs.com/kubernetes-guides/advanced-guides/device-plugins.md)),
-    `replicas: 1`, `strategy: Recreate`, node selector.
+    `replicas: 1`, `strategy: Recreate`, and a node selector.
 - **PID 1 is tini**: `ENTRYPOINT ["tini","--","ripper"]`, `CMD ["serve"]`. Compose uses `init: true`.
-- **Shutdown budget**: `lifecycle.Spec` uses `PropagationDelay: NoPropagationDelay` (single
-  replica + Recreate, the case the kit documents), `DrainTimeout: 5s`, the default `FlushTimeout`
-  (5s), and the engine worker `StopTimeout: 15s`. Total grace = 5 + 5 + 15 + 5 margin = **30 s**.
-  Set compose `stop_grace_period: 30s` and k8s `terminationGracePeriodSeconds: 30`.
-- **Health**: Docker `HEALTHCHECK CMD ["ripper","healthcheck"]` → admin `/healthz`. k8s probes
-  use `/healthz` (liveness) and `/readyz` (readiness; checks the drive).
-- Go ≥ 1.25 sets `GOMAXPROCS` from the container CPU limit automatically; nothing to do.
+- **Shutdown budget**:
+  - `PropagationDelay: NoPropagationDelay`;
+  - `DrainTimeout: 5s`;
+  - `FlushTimeout`: the default, 5s;
+  - engine `StopTimeout: 15s`. The kit cancels the context immediately; 15 s is the cleanup budget.
+  
+  Total grace = 5 + 5 + 15 + 5 margin = **30 s**. Use compose `stop_grace_period: 30s` and
+  k8s `terminationGracePeriodSeconds: 30`.
+- **Health**: Docker `HEALTHCHECK CMD ["ripper","healthcheck"]` checks admin `/healthz`.
+  - k8s liveness probe: `/healthz`.
+  - k8s readiness probe: `/readyz`, with checks `drive` (device present) and `detector` (fewer than
+    5 bad replies in a row).
+- Go ≥ 1.25 sets `GOMAXPROCS` from the container's CPU limit automatically.
 
 ## 7. Dependencies
 
 ### 7.1 Go modules
 
-cobra v1.10.2, viper v1.21.0, go-service-kit v0.3.0, apprise-go v0.3.3 (exact; pre-1.0),
-`golang.org/x/sys` (phase 6). Notes:
-- apprise-go's `Send` has no `context` and uses its own HTTP client. It bypasses kit `outbound`,
-  so it is wrapped with a timeout (C§5.2); this is accepted.
-- go-service-kit refused to vendor large JS. Ripper vendors Scalar anyway (decision 17), so ripper
-  owns the CSP relaxation (`style-src 'unsafe-inline'` on `/docs` only) and the Renovate/sha256 upkeep.
+| Module | Version | Notes |
+|---|---|---|
+| cobra | v1.10.2 | |
+| viper | v1.21.0 | |
+| go-service-kit | v0.3.0 | |
+| apprise-go | v0.3.3 (exact) | pre-1.0 |
+
+Two trade-offs are accepted:
+- apprise-go's `Send` has no context and uses its own HTTP client, so it bypasses kit `outbound`.
+  It is wrapped with a timeout (C§5.2).
+- Vendoring Scalar means ripper owns a CSP relaxation (`style-src 'unsafe-inline'`, on `/docs` only)
+  and the Renovate/sha256 upkeep.
 
 ### 7.2 External tools
 
 | Tool | Decision | Backend |
 |---|---|---|
-| `makemkvcon` | keep (proprietary) | `detect/makemkv`, `rip/makemkv`, registration |
+| `makemkvcon` | keep (proprietary) | `detect/makemkv`, `rip/makemkv`, `makemkvkey.Register` |
 | `abcde` + cdparanoia/lame/flac/eyeD3/metaflac/glyrc | keep | `rip/abcde` |
-| `ddrescue` | keep | `rip/ddrescue` |
-| `cdparanoia -Q` | keep → ioctl in phase 6 | inside `detect/makemkv` → `detect/native` |
-| `eject`, `sdparm` | keep → ioctl in phase 6 | `eject/execeject` → `eject/ioctleject` |
+| `ddrescue` | keep (with a map file) | `rip/ddrescue` |
+| `cdparanoia -Q` | keep | inside `detect/makemkv` |
+| `eject`, `sdparm` | keep | `eject/execeject` |
 | curl, grep/sed/cut/date/timeout, useradd, python/flask, phusion, syslog-ng | **remove** | apprise-go, kit, stdlib |
-| user hook scripts | **remove** | — |
 
-## 8. Behaviour changes (migration notes)
+## 8. Migration notes (for the README)
 
-| # | Old | New |
-|---|---|---|
-| D1 | Unordered pattern map; empty label matched "CD" | Ordered rules on parsed fields (C§3.1) |
-| D2 | Data CDs sent to abcde | Data CDs → ISO. DVD/BD data discs unchanged until phase 6 |
-| D3 | Unrecognised reply below threshold → "rip" branch + eject | Counted as bad; no rip, no eject |
-| D4 | Drive index from `cut -c5` | Parsed integer (indexes ≥ 10 work) |
-| D5 | `--profile=/config/default.mmcp.xml` (never existed) | `$CONFIG_DIR/default.mmcp.xml` if present, else the embedded default |
-| D6 | `ALSOMAKEISO` imaged audio CDs after abcde had ejected them | Skipped with a warning |
-| D7 | Raw/empty labels used as dir names | Sanitised; empty → `disc_<ts>`; collisions suffixed |
-| D8 | Bad threshold killed the ripper; the UI kept running | Process exits 1; restart policy restarts it |
-| D9 | MakeMKV key printed; `~/.MakeMKV` 777 | Key redacted; dir 0700, file 0600 |
-| D10 | Pushover via `POVER_*`, fixed text | `APPRISE_URLS`; Success/Failure/Stopped events |
-| D11 | Basic auth realm "FeedCrawler", plain compare | Realm "Ripper", constant-time; CSRF protection |
-| D12 | `/config/ripper.sh` and hook scripts executed | Not executed |
-| D13 | `useradd`/`groupadd` at start | Name lookup, else numeric IDs |
-| D14 | `PREFIX`/`USER`/`PASS` | `WEB_PATH_PREFIX`/`WEB_USERNAME`/`WEB_PASSWORD` |
-| D15 | Plain-text log; `DEBUG`/`DEBUGTOWEB` | JSON log; `LOG_LEVEL` |
-| D16 | `/api/log/` | `/api/v1/log`, `/api/v1/status`; OpenAPI + Scalar `/docs` |
-| D17 | One port 9090 | 9090 API/UI/docs, 9091 admin |
-| D18 | `docker stop` left partial output | Clean cancel; partial output removed |
-| D19 | phusion base, python, syslog-ng | `ubuntu:noble` + tools + tini + `ripper` |
-| D20 | Booleans: only literal `true` | Anything `strconv.ParseBool` accepts |
-| D21 | A user `abcde.conf` `OUTPUTDIR` overrode `STORAGE_CD` | `STORAGE_CD` always decides (staging dir) |
-| D22 | abcde `-x` / `EJECTCD=y` ejected even with `EJECTENABLED=false` | No `-x`, `EJECTCD=n`; the engine is the only ejector |
-| D23 | `rm -rf /tmp/*.tmp` every loop | Removed; ripper cleans its own temp files |
-| D24 | petite-vue/bootstrap log page | React + AntD UI (status + log) |
-| D25 | `chmod` honoured the umask; symbolic only | Umask ignored; octal also accepted |
-| D26 | chown/chmod of whole storage roots and `/config` | Only the finalized output path |
-| D27 | `JUSTMAKEISO` tried to image audio CDs | Skipped with a warning |
-| D28 | A failed rip still moved/chowned its output | Partial output removed; Failure notification; disc still ejected |
+**Configuration:** all variables are renamed to `RIPPER_*` (C§1.2).
+
+| Old | New |
+|---|---|
+| `DRIVE` | `RIPPER_DRIVE` |
+| `STORAGE_CD/DATA/DVD/BD` | `RIPPER_OUTPUT_DIR` (fixed `CD/ DATA/ DVD/ BluRay/` subdirs; `/out/Ripper` keeps the old layout) |
+| `EJECTENABLED` | `RIPPER_EJECT` |
+| `JUSTMAKEISO` / `ALSOMAKEISO` | `RIPPER_ISO_MODE=only` / `also` |
+| `MINIMUMLENGTH` | `RIPPER_MIN_TITLE_LENGTH` |
+| `FILEUSER`/`FILEUSERID`, `FILEGROUP`/`FILEGROUPID` | `RIPPER_UID`, `RIPPER_GID` (numeric; unset = no chown) |
+| `FILEMODE` (symbolic) | `RIPPER_UMASK` (octal, default `002`) |
+| `KEY` | `RIPPER_MAKEMKV_KEY` |
+| `POVER_APP_TOKEN` + `POVER_USER_KEY` | `RIPPER_APPRISE_URLS=pover://USER_KEY@APP_TOKEN` |
+| `PREFIX` / `USER` / `PASS` | `RIPPER_WEB_PATH_PREFIX` / `RIPPER_WEB_USERNAME` / `RIPPER_WEB_PASSWORD` |
+| `DEBUG`, `DEBUGTOWEB` | `RIPPER_LOG_LEVEL` |
+| `TIMESTAMPPREFIX`, `SEPARATERAWFINISH`, `BAD_THRESHOLD` | removed |
+
+**Removed features**
+- `/config/ripper.sh` and the hook scripts (`BLURAYrip.sh`, `DVDrip.sh`, `CDrip.sh`, `DATArip.sh`).
+  Use an apprise webhook target for automation after a rip.
+- The `finished/` folder (staging makes every final folder complete by construction).
+- The timestamp prefix.
+- `/config/Ripper.log`, and clearing the log from the UI.
+- Exit on repeated bad drive replies.
+- User and group names (numeric IDs only).
+
+**Behaviour changes**
+1. Detection uses ordered rules on parsed fields. An empty drive can no longer be "ripped" as a CD,
+   and drive indexes ≥ 10 work.
+2. Data CDs are imaged with ddrescue instead of being sent to abcde. DVD/BD data discs are still
+   treated as video.
+3. An unrecognised drive reply never triggers a rip or an eject.
+4. After any rip attempt the engine waits for the disc to be removed: no re-rip loops.
+5. Rips are staged and renamed into place. Partial output is removed on failure, on shutdown, and
+   at the next start after a crash.
+6. `ddrescue` writes a `.map` file next to the `.iso`, so an interrupted ISO rip can resume.
+7. abcde no longer ejects; the ripper is the only thing that ejects. `RIPPER_EJECT=false` is now
+   honoured for CDs.
+8. `RIPPER_OUTPUT_DIR` decides where audio CDs go, even if your `abcde.conf` sets `OUTPUTDIR`.
+9. `ISO_MODE` skips audio CDs, which can't be imaged.
+10. `default.mmcp.xml` is now actually used: from `/config` if present, otherwise the built-in one.
+11. The MakeMKV key is never logged; `~/.MakeMKV` has mode 0700.
+12. JSON logs on stdout. The UI shows the last 2000 records since the process started.
+13. The API is `/api/v1/status` and `/api/v1/log`, with OpenAPI at `/openapi.json` and docs at `/docs`.
+    Admin endpoints are on port 9091.
+14. The web UI is rewritten in React + Ant Design. Basic auth is constant-time, with CSRF protection.
+15. The image is `ubuntu:noble` + tools + tini + `ripper`, published to `ghcr.io/jacaudi/docker-ripper`.
 
 ## 9. Repository admin (manual)
 
 - Protect `archive`: Settings → Rules → Rulesets → New branch ruleset → target `archive`;
-  enable *Restrict deletions*, *Block force pushes*, *Restrict updates*.
-- ghcr publishing needs `permissions: packages: write` in the workflow; nothing else.
-- Create a GitHub App for release-please (contents + pull-requests: write), install it on the repo,
-  and add the secrets `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY` (L§5).
+  enable *Restrict deletions*, *Block force pushes* and *Restrict updates*.
+- Create a GitHub App for release-please (contents + pull-requests: write) and install it.
+  Add the secrets `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY` (L§5).
 - Settings → General: allow squash merging only, with the PR title as the default commit message.
 - Settings → Actions → General: allow GitHub Actions to create and approve pull requests.
-- Branch protection on `main`: require `ci` jobs, `security` CodeQL, and a linear history.
+- Branch protection on `main`: require the `ci` jobs and CodeQL; require a linear history.
 
 ## 10. Remaining risks
 
-- **apprise-go** is pre-1.0 and not every target is tested upstream. It sits behind the
-  `Notifier` seam; re-evaluate at phase 3.
-- **golangci-lint vs Go 1.27**: verified that v2.14.0 built with go1.27.2 accepts our config. `task tools`
-  builds it from source with the repo toolchain for exactly this reason.
-- **DVD/BD data-disc detection** has no known MakeMKV signal; it waits for hardware fixtures (phase 6).
+- **apprise-go** is pre-1.0. It sits behind the `Notifier` seam; re-evaluate in phase 2.
+- **`makemkvcon reg`** is assumed to write `app_Key` itself; this is checked at P4.5.
+- **DVD/BD data discs** are treated as video until a hardware capture shows a distinguishing signal.
+- **The beta key** is fetched once per start; the weekly rebuild and the restart policy cover rotation.
 
 ## References
 
 - go-service-kit: https://github.com/leftathome/go-service-kit
+- apprise-go: https://pkg.go.dev/github.com/unraid/apprise-go · https://unraid.net/blog/apprise-go
+- Scalar configuration: https://github.com/scalar/scalar/blob/main/documentation/configuration.md
 - Task: https://taskfile.dev · golangci-lint: https://golangci-lint.run · govulncheck: https://go.dev/doc/security/vuln/
 - release-please action: https://github.com/googleapis/release-please-action · Conventional Commits: https://www.conventionalcommits.org
 - OSV-Scanner: https://google.github.io/osv-scanner/ · OpenSSF Scorecard: https://github.com/ossf/scorecard · Trivy: https://trivy.dev
-- apprise-go: https://pkg.go.dev/github.com/unraid/apprise-go · https://unraid.net/blog/apprise-go
-- Scalar configuration: https://github.com/scalar/scalar/blob/main/documentation/configuration.md
 - Go module layout: https://go.dev/doc/modules/layout
 - Device plugins: https://github.com/squat/generic-device-plugin/issues/62 ·
   https://docs.siderolabs.com/kubernetes-guides/advanced-guides/device-plugins.md

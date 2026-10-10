@@ -1,8 +1,8 @@
 # Contracts
 
 Everything in this file is **normative**. When a task in [`phases.md`](phases.md) says
-"implement X per contracts §N", copy names, signatures, values and orderings exactly.
-If something you need is missing here, stop and ask; do not invent it.
+"implement X per C§n", copy names, signatures, values and orderings exactly. If something you
+need is missing here, stop and ask; do not invent it.
 
 Module path: `github.com/jacaudi/docker-ripper`. All packages below live under it.
 
@@ -12,83 +12,62 @@ Module path: `github.com/jacaudi/docker-ripper`. All packages below live under i
 
 ### 1.1 Rules
 
-- **viper is the only config loader**, and only `internal/cli` imports it.
-- Use `v := viper.New()`, never the package-level viper.
-- For every row in §1.2: `v.SetDefault(key, default)` and `v.BindEnv(key, ENV_NAME)`.
-  Bind each name explicitly; do not use `AutomaticEnv` or a key replacer.
-- Flags: `serve` defines `--headless` only. Bind it with `v.BindPFlag("headless", cmd.Flags().Lookup("headless"))`
-  inside `PersistentPreRunE`. Precedence: flag > env > default.
-- **An empty env value counts as unset** and the default applies. This is viper's default
-  (`AllowEmptyEnv(false)`) and matches bash `${VAR:=default}`. Do not change it, and test it.
-- Decode with `v.Unmarshal(&cfg)`. Viper's default hooks already convert strings to
-  `time.Duration` and comma-separated strings to `[]string`.
-- Booleans accept everything `strconv.ParseBool` accepts. Legacy bash accepted only `true` (deviation D20).
-- After decoding, call `cfg.Validate()`. It returns `errors.Join` of **every** problem.
+- **viper is the only config loader**, and only `internal/cli` imports it. Always create it with
+  `v := viper.New()`; do not use the package-level viper instance.
+- `v.SetEnvPrefix("RIPPER")`. For **every** row in §1.2: `v.SetDefault(key, default)` and
+  `v.BindEnv(key)`. Do not call `v.AutomaticEnv()`.
+- Flags: `serve` defines one flag, `--headless`. Bind it with
+  `v.BindPFlag("headless", cmd.Flags().Lookup("headless"))` in `PersistentPreRunE`.
+  Precedence: flag > env > default.
+- **An empty env value counts as unset**, so the default applies. This is viper's default
+  (`AllowEmptyEnv(false)`); do not change it, and test it.
+- Decode with `v.Unmarshal(&cfg)`. Each field has a `mapstructure:"<key>"` tag. Viper's default
+  hooks already turn strings into `time.Duration` and comma-separated strings into `[]string`.
+- Booleans accept anything `strconv.ParseBool` accepts.
+- After decoding, call `cfg.Validate()`. It returns `errors.Join` of **every** problem it finds.
 
-### 1.2 Keys
+### 1.2 Keys (complete list)
 
-| Env name | viper key / Go field | Type | Default | Validation |
+| Env | viper key / Go field | Type | Default | Validation / meaning |
 |---|---|---|---|---|
-| `DRIVE` | `drive` / `Drive` | string | `/dev/sr0` | non-empty, absolute |
-| `STORAGE_CD` | `storage_cd` / `StorageCD` | string | `/out/Ripper/CD` | absolute |
-| `STORAGE_DATA` | `storage_data` / `StorageData` | string | `/out/Ripper/DATA` | absolute |
-| `STORAGE_DVD` | `storage_dvd` / `StorageDVD` | string | `/out/Ripper/DVD` | absolute |
-| `STORAGE_BD` | `storage_bd` / `StorageBD` | string | `/out/Ripper/BluRay` | absolute |
-| `EJECTENABLED` | `eject_enabled` / `EjectEnabled` | bool | `true` | — |
-| `JUSTMAKEISO` | `just_make_iso` / `JustMakeISO` | bool | `false` | not both with `ALSOMAKEISO` |
-| `ALSOMAKEISO` | `also_make_iso` / `AlsoMakeISO` | bool | `false` | — |
-| `SEPARATERAWFINISH` | `separate_raw_finish` / `SeparateRawFinish` | bool | `false` | — |
-| `TIMESTAMPPREFIX` | `timestamp_prefix` / `TimestampPrefix` | bool | `false` | — |
-| `MINIMUMLENGTH` | `minimum_length` / `MinimumLength` | int (seconds) | `600` | ≥ 0 |
-| `BAD_THRESHOLD` | `bad_threshold` / `BadThreshold` | int | `5` | ≥ 1 |
-| `FILEUSER` | `file_user` / `FileUser` | string | `nobody` | non-empty |
-| `FILEUSERID` | `file_user_id` / `FileUserID` | int | `321` | ≥ 0 |
-| `FILEGROUP` | `file_group` / `FileGroup` | string | `users` | non-empty |
-| `FILEGROUPID` | `file_group_id` / `FileGroupID` | int | `4321` | ≥ 0 |
-| `FILEMODE` | `file_mode` / `FileMode` | string | `g+rw` | parses with `output.ParseMode` (§5.4) |
-| `KEY` | `key` / `Key` | string | `""` | empty or `^T-[A-Za-z0-9@_]{66}$` |
-| `APPRISE_URLS` | `apprise_urls` / `AppriseURLs` | []string (comma-sep) | empty | each accepted by `apprise.New().Add` |
-| `API_ADDR` | `api_addr` / `APIAddr` | string | `:9090` | `net.SplitHostPort` ok |
-| `ADMIN_ADDR` | `admin_addr` / `AdminAddr` | string | `:9091` | `net.SplitHostPort` ok, ≠ `API_ADDR` |
-| `HEADLESS` (`--headless`) | `headless` / `Headless` | bool | `false` | — |
-| `WEB_PATH_PREFIX` | `web_path_prefix` / `WebPathPrefix` | string | `""` | normalised (§1.3) |
-| `WEB_USERNAME` | `web_username` / `WebUsername` | string | `""` | both-or-neither with password |
-| `WEB_PASSWORD` | `web_password` / `WebPassword` | string | `""` | both-or-neither with username |
-| `API_DOCS_ENABLED` | `api_docs_enabled` / `APIDocsEnabled` | bool | `true` | — |
-| `PPROF_ENABLED` | `pprof_enabled` / `PprofEnabled` | bool | `false` | — |
-| `CONFIG_DIR` | `config_dir` / `ConfigDir` | string | `/config` | absolute |
-| `LOG_FILE` | `log_file` / `LogFile` | string | `/config/Ripper.log` | absolute |
-| `LOG_LEVEL` | `log_level` / `LogLevel` | string | `info` | `debug\|info\|warn\|error` (`obs.ParseLevel`) |
-| `DETECTOR_BACKEND` | `detector_backend` / `DetectorBackend` | string | `makemkv` | `makemkv` (+ `native` after phase 6) |
-| `EJECT_BACKEND` | `eject_backend` / `EjectBackend` | string | `exec` | `exec` (+ `ioctl` after phase 6) |
-| `POLL_INTERVAL` | `poll_interval` / `PollInterval` | duration | `60s` | ≥ 1s |
-| `MANUAL_EJECT_POLL` | `manual_eject_poll` / `ManualEjectPoll` | duration | `5s` | ≥ 1s |
-| `DETECT_TIMEOUT` | `detect_timeout` / `DetectTimeout` | duration | `30s` | ≥ 1s |
+| `RIPPER_DRIVE` | `drive` / `Drive` | string | `/dev/sr0` | non-empty, absolute |
+| `RIPPER_OUTPUT_DIR` | `output_dir` / `OutputDir` | string | `/out/Ripper` | absolute. Fixed subdirs `BluRay/ DVD/ CD/ DATA/` |
+| `RIPPER_CONFIG_DIR` | `config_dir` / `ConfigDir` | string | `/config` | absolute. Optional overrides `abcde.conf`, `default.mmcp.xml` |
+| `RIPPER_EJECT` | `eject` / `Eject` | bool | `true` | `false` = leave the disc for manual removal |
+| `RIPPER_ISO_MODE` | `iso_mode` / `ISOMode` | string | `off` | one of `off`, `also`, `only` |
+| `RIPPER_MIN_TITLE_LENGTH` | `min_title_length` / `MinTitleLength` | int (s) | `600` | ≥ 0; MakeMKV `--minlength` |
+| `RIPPER_UID` | `uid` / `UID` | int | `-1` | ≥ −1; −1 = don't change the owner |
+| `RIPPER_GID` | `gid` / `GID` | int | `-1` | ≥ −1; −1 = don't change the group |
+| `RIPPER_UMASK` | `umask` / `Umask` | string (octal) | `002` | `strconv.ParseUint(s, 8, 32)` ≤ `0o777` |
+| `RIPPER_MAKEMKV_KEY` | `makemkv_key` / `MakeMKVKey` | string | `""` | empty or `^T-[A-Za-z0-9@_]{66}$`. Empty = fetch the beta key |
+| `RIPPER_APPRISE_URLS` | `apprise_urls` / `AppriseURLs` | []string | empty | each accepted by `apprise.New().Add`. Empty = no notifications |
+| `RIPPER_POLL_INTERVAL` | `poll_interval` / `PollInterval` | duration | `60s` | ≥ 1s |
+| `RIPPER_LOG_LEVEL` | `log_level` / `LogLevel` | string | `info` | `debug\|info\|warn\|error` (`obs.ParseLevel`) |
+| `RIPPER_API_ADDR` | `api_addr` / `APIAddr` | string | `:9090` | `net.SplitHostPort` ok |
+| `RIPPER_ADMIN_ADDR` | `admin_addr` / `AdminAddr` | string | `:9091` | `net.SplitHostPort` ok; ≠ `APIAddr` |
+| `RIPPER_HEADLESS` / `--headless` | `headless` / `Headless` | bool | `false` | no web UI when true |
+| `RIPPER_WEB_PATH_PREFIX` | `web_path_prefix` / `WebPathPrefix` | string | `""` | normalised (§1.3) |
+| `RIPPER_WEB_USERNAME` | `web_username` / `WebUsername` | string | `""` | both-or-neither with the password |
+| `RIPPER_WEB_PASSWORD` | `web_password` / `WebPassword` | string | `""` | both-or-neither with the username |
 
-Every Go field gets a `mapstructure:"<viper key>"` tag.
+Constants (not configurable): detect timeout 30 s; bad-response threshold 5; log ring 2000 records.
 
-**Removed variables.** At startup, if any of these is set (non-empty), log one WARN naming it
-and its replacement, then continue:
-`DEBUG`, `DEBUGTOWEB` → `LOG_LEVEL`; `POVER_APP_TOKEN`, `POVER_USER_KEY` → `APPRISE_URLS`
-(`pover://USER_KEY@APP_TOKEN`); `OPTIONAL_WEB_UI_PATH_PREFIX`, `OPTIONAL_WEB_UI_USERNAME`,
-`OPTIONAL_WEB_UI_PASSWORD` → `WEB_*`. Do **not** warn on `PREFIX`/`USER`/`PASS`, because shells set `USER`.
+### 1.3 `RIPPER_WEB_PATH_PREFIX` normalisation
 
-### 1.3 `WEB_PATH_PREFIX` normalisation
-
-`""` or `/` → `""`. Otherwise ensure exactly one leading `/` and strip trailing `/`.
-Reject anything containing `?`, `#`, `{`, `}` or whitespace. Examples: `ripper` → `/ripper`;
-`/ripper/` → `/ripper`; `/a/b` → `/a/b`.
+- `""` or `/` → `""`.
+- Otherwise: exactly one leading `/`, no trailing `/`.
+- Reject values containing `?`, `#`, `{`, `}` or whitespace.
+- Examples: `ripper` → `/ripper`; `/ripper/` → `/ripper`; `/a/b` → `/a/b`.
 
 ---
 
 ## 2. Go types and interfaces (copy exactly)
 
-### 2.1 `internal/disc`
+### 2.1 `internal/disc` (types only; no parsing here)
 
 ```go
 package disc
 
-// State is the drive state reported by the detector.
 type State int
 
 const (
@@ -99,7 +78,6 @@ const (
 	StateInserted              // disc present; see Kind
 )
 
-// Kind is what is in the drive when State == StateInserted.
 type Kind int
 
 const (
@@ -112,27 +90,24 @@ const (
 )
 
 type Disc struct {
-	Index  int    // makemkv drive index
-	State  State
-	Kind   Kind
-	Label  string // raw label as reported (NOT sanitised)
-	Device string // e.g. /dev/sr0
-	Raw    string // the DRV: line that produced this value
+	Index  int    `json:"index"`
+	State  State  `json:"state"`
+	Kind   Kind   `json:"kind"`
+	Label  string `json:"label"`  // raw label as reported (NOT sanitised)
+	Device string `json:"device"`
+	Raw    string `json:"raw"`    // the DRV: line that produced this value
 }
 
-func (s State) String() string // "unknown","empty","open","loading","inserted"
-func (k Kind) String() string  // "none","bluray","dvd","cd","audio_cd","data"
+// String and MarshalText return: "unknown","empty","open","loading","inserted"
+func (s State) String() string
+func (s State) MarshalText() ([]byte, error)
 
-var (
-	ErrNoDriveLine = errors.New("disc: no DRV line for device")
-	ErrMalformed   = errors.New("disc: malformed DRV line")
-)
-
-// ParseDRV finds the DRV line whose device field equals device and classifies it per §3.1.
-func ParseDRV(out []byte, device string) (Disc, error)
+// String and MarshalText return: "none","bluray","dvd","cd","audio_cd","data"
+func (k Kind) String() string
+func (k Kind) MarshalText() ([]byte, error)
 ```
 
-### 2.2 Seams (interfaces live in the seam package; backends in sub-packages)
+### 2.2 Seams (five; the interface lives in the seam package, backends in sub-packages)
 
 ```go
 // internal/runner
@@ -145,13 +120,13 @@ type Cmd struct {
 }
 
 type Runner interface {
-	// Run streams stdout+stderr line by line to the logger and waits.
+	// Run streams stdout+stderr line by line to the logger (one record per line) and waits.
 	Run(ctx context.Context, c Cmd) error
-	// Output returns combined stdout+stderr (capped at 1 MiB) and also logs it at DEBUG.
+	// Output returns combined stdout+stderr (capped at 1 MiB).
 	Output(ctx context.Context, c Cmd) ([]byte, error)
 }
 
-// ExitError reports a non-zero exit. Wrapped; use errors.AsType[*runner.ExitError].
+// ExitError reports a non-zero exit. Callers use errors.AsType[*runner.ExitError].
 type ExitError struct {
 	Tool string
 	Code int
@@ -174,8 +149,8 @@ type Detector interface {
 // internal/rip
 package rip
 
-// Ripper writes its output into dir, which the engine has created and owns.
-// On ctx cancellation it returns promptly; the engine deletes dir.
+// Ripper writes its output into dir. The engine created dir (a staging dir) and owns it.
+// On ctx cancellation it returns promptly; the engine deletes the staging dir.
 type Ripper interface {
 	Rip(ctx context.Context, d disc.Disc, dir string) error
 }
@@ -213,35 +188,25 @@ type Notifier interface {
 }
 ```
 
-```go
-// internal/mkvkey
-package mkvkey
+### 2.3 Backends and helpers
 
-type Source interface {
-	Key(ctx context.Context) (string, error)
-}
-```
-
-### 2.3 Backends (package path → constructor)
-
-| Package | Constructor | Implements |
+| Package | Constructor / API | Implements |
 |---|---|---|
 | `internal/runner/execrunner` | `New(logger *slog.Logger) *Runner` | `runner.Runner` |
-| `internal/detect/makemkv` | `New(r runner.Runner, device string, timeout time.Duration) *Detector` | `detect.Detector` |
-| `internal/rip/makemkv` | `New(r runner.Runner, profilePath string, minLength int) *Ripper` | `rip.Ripper` |
-| `internal/rip/abcde` | `New(r runner.Runner, device, baseConfPath string) *Ripper` | `rip.Ripper` |
+| `internal/detect/makemkv` | `New(r runner.Runner, device string, timeout time.Duration) *Detector`; `func ParseDRV(out []byte, device string) (disc.Disc, error)`; `ErrNoDriveLine`, `ErrMalformed` | `detect.Detector` |
+| `internal/rip/makemkv` | `New(r runner.Runner, configDir string, minLength int) (*Ripper, error)`; embeds `default.mmcp.xml` | `rip.Ripper` |
+| `internal/rip/abcde` | `New(r runner.Runner, device, configDir string) (*Ripper, error)`; embeds `abcde.conf` | `rip.Ripper` |
 | `internal/rip/ddrescue` | `New(r runner.Runner, device string) *Ripper` | `rip.Ripper` |
 | `internal/eject/execeject` | `New(r runner.Runner, device string) *Ejector` | `eject.Ejector` |
 | `internal/notify/apprise` | `New(urls []string) (*Notifier, error)` | `notify.Notifier` |
-| `internal/notify/nop` | `New() Notifier` (value type) | `notify.Notifier` |
-| `internal/mkvkey/env` | `New(key string) Source` | `mkvkey.Source` |
-| `internal/mkvkey/forum` | `New(d outbound.Doer, url string) *Source`; `const DefaultURL` | `mkvkey.Source` |
-| phase 6: `internal/eject/ioctleject`, `internal/detect/native` | see phases.md P6 | |
+| `internal/notify/nop` | `type Notifier struct{}` | `notify.Notifier` |
+| `internal/makemkvkey` | `FetchBetaKey(ctx, d outbound.Doer, url string) (string, error)`; `const ForumURL`; `Register(ctx, r runner.Runner, key string) error` | — (functions) |
+| `internal/output` | `Planner` (§3.5) | — |
+| `internal/logring` | `New(capacity int) *Ring`; `(*Ring).Write([]byte) (int, error)`; `(*Ring).Lines(n int) []string` | `io.Writer` |
 
-The detect and rip `makemkv` packages share the name `makemkv`. Import them in
-`internal/patchbay` as `makemkvdetect "…/internal/detect/makemkv"` and
-`makemkvrip "…/internal/rip/makemkv"`. Each package gets a compile-time assertion, e.g.
-`var _ rip.Ripper = (*Ripper)(nil)`.
+- **Name clash:** `detect/makemkv` and `rip/makemkv` share the package name `makemkv`. Import them
+  in `internal/patchbay` as `makemkvdetect` and `makemkvrip`.
+- **Compile-time assertion:** every backend declares one, e.g. `var _ rip.Ripper = (*Ripper)(nil)`.
 
 ### 2.4 Engine
 
@@ -256,57 +221,52 @@ const (
 	StateDetecting       State = "detecting"
 	StateRipping         State = "ripping"
 	StateEjecting        State = "ejecting"
-	StateWaitingForEject State = "waiting_for_eject"
+	StateAwaitingRemoval State = "awaiting_removal"
 	StateStopped         State = "stopped"
 )
 
-type Mode int
+type ISOMode string
 
 const (
-	ModeNormal  Mode = iota
-	ModeJustISO      // JUSTMAKEISO
-	ModeAlsoISO      // ALSOMAKEISO
+	ISOOff  ISOMode = "off"
+	ISOAlso ISOMode = "also"
+	ISOOnly ISOMode = "only"
 )
 
+const BadThreshold = 5
+
 type Deps struct {
-	Detect  detect.Detector
-	Rippers map[disc.Kind]rip.Ripper // keys: KindBluRay, KindDVD, KindAudioCD, KindData
-	ISO     rip.Ripper               // the ddrescue ripper (same instance as Rippers[KindData])
-	Eject   eject.Ejector
-	Notify  notify.Notifier
-	Output  *output.Planner
-	Logger  *slog.Logger
-	Now     func() time.Time // time.Now in prod; tests may override
+	Detect detect.Detector
+	Video  rip.Ripper // BluRay and DVD
+	Audio  rip.Ripper // audio CD
+	ISO    rip.Ripper // ddrescue
+	Eject  eject.Ejector
+	Notify notify.Notifier
+	Output *output.Planner
+	Logger *slog.Logger
+	Now    func() time.Time // time.Now in prod
 }
 
 type Config struct {
-	Mode            Mode
-	EjectEnabled    bool
-	BadThreshold    int
-	PollInterval    time.Duration
-	ManualEjectPoll time.Duration
+	ISOMode      ISOMode
+	Eject        bool
+	PollInterval time.Duration
 }
 
-type Engine struct{ /* unexported */ }
+type Engine struct{ /* unexported; mutex-guarded status */ }
 
 func New(d Deps, c Config) *Engine
-func (e *Engine) Run(ctx context.Context) error // lifecycle.Worker.Run
-func (e *Engine) Status() Status                // safe for concurrent use (sync.Mutex)
-
-var ErrTooManyBadResponses = errors.New("engine: too many consecutive bad detector responses")
+func (e *Engine) Run(ctx context.Context) error   // lifecycle.Worker.Run; returns nil on ctx cancel
+func (e *Engine) Status() Status                  // safe for concurrent use
+func (e *Engine) Ready(ctx context.Context) error // readiness check "detector": error iff bad ≥ BadThreshold
 
 type Status struct {
-	State        State       `json:"state"`
-	Disc         *DiscInfo   `json:"disc,omitempty"`
-	StartedAt    *time.Time  `json:"started_at,omitempty"`
-	LastResult   *LastResult `json:"last_result,omitempty"`
-	BadResponses int         `json:"bad_responses"`
-}
-
-type DiscInfo struct {
-	Kind   string `json:"kind"`  // disc.Kind.String()
-	Label  string `json:"label"`
-	Device string `json:"device"`
+	State           State       `json:"state"`
+	Disc            *disc.Disc  `json:"disc,omitempty"`
+	StartedAt       *time.Time  `json:"started_at,omitempty"`
+	LastResult      *LastResult `json:"last_result,omitempty"`
+	BadResponses    int         `json:"bad_responses"`
+	AwaitingRemoval bool        `json:"awaiting_removal"`
 }
 
 type LastResult struct {
@@ -314,7 +274,7 @@ type LastResult struct {
 	Kind       string    `json:"kind"`
 	Outcome    string    `json:"outcome"` // "success" | "failure" | "cancelled" | "skipped"
 	Error      string    `json:"error,omitempty"`
-	Dir        string    `json:"dir,omitempty"`
+	Paths      []string  `json:"paths,omitempty"` // finalized paths, relative to OUTPUT_DIR
 	FinishedAt time.Time `json:"finished_at"`
 }
 ```
@@ -323,15 +283,15 @@ type LastResult struct {
 
 ## 3. Behaviour tables
 
-### 3.1 DRV parsing (`disc.ParseDRV`)
+### 3.1 DRV parsing (`makemkv.ParseDRV` in `detect/makemkv`)
 
 1. Iterate lines with `strings.Lines`. Keep lines that start with `DRV:`.
 2. Parse `strings.TrimPrefix(line, "DRV:")` with `csv.NewReader` (`LazyQuotes: true`,
    `FieldsPerRecord: -1`). Fewer than 7 fields → `ErrMalformed`.
 3. Fields: `[0]` index (int), `[1]` state (int), `[2]` ignored, `[3]` flags (int),
    `[4]` drive name, `[5]` label, `[6]` device.
-4. Pick the first line whose `[6] == device`. None → `ErrNoDriveLine`.
-5. Classify, **in this order**:
+4. Use the first line whose `[6] == device`. No such line → `ErrNoDriveLine`.
+5. Classify, in this order:
 
 | state | flags | → State | → Kind |
 |---|---|---|---|
@@ -340,93 +300,122 @@ type LastResult struct {
 | 3 | any | Loading | None |
 | 2 | 12 or 28 | Inserted | BluRay |
 | 2 | 1 | Inserted | DVD |
-| 2 | 0 | Inserted | CD (detector resolves) |
+| 2 | 0 | Inserted | CD (the detector resolves it) |
 | anything else | | Unknown | None |
 
-An empty label never changes the classification (this fixes legacy bug #1).
+An empty label never changes the classification.
 
 ### 3.2 Detector (`detect/makemkv`)
 
-1. `Output(ctx with DetectTimeout, {Name:"makemkvcon", Args:["-r","--cache=1","info","disc:9999"], Tool:"makemkvcon"})`.
-   A timeout or exit error returns `(Disc{State: StateUnknown}, err)`.
-2. `disc.ParseDRV(out, device)`. On error return `StateUnknown` and the error.
-3. If `Kind == KindCD` **or** `State == StateEmpty`: run
-   `Output(ctx, {Name:"cdparanoia", Args:["-d",device,"-Q"], Tool:"cdparanoia"})` and ignore
-   its exit code. If the output contains `audio tracks`, the result is State Inserted +
-   Kind AudioCD. Otherwise, if Kind was CD, it is Kind Data; if State was Empty, it stays Empty.
-4. Return the Disc. DVD/BD **data** discs stay DVD/BluRay until a hardware fixture shows a
-   distinguishing signal (phase 6).
+1. Call `Output(ctxWithTimeout(30s), {Name:"makemkvcon", Args:["-r","--cache=1","info","disc:9999"], Tool:"makemkvcon"})`.
+   If it times out or exits with an error, return `(Disc{State: StateUnknown}, err)`.
+2. Call `ParseDRV(out, device)`. If it returns an error, return `StateUnknown` and the error.
+3. If `Kind == KindCD` **or** `State == StateEmpty`, run
+   `Output(ctx, {Name:"cdparanoia", Args:["-d",device,"-Q"], Tool:"cdparanoia"})` and ignore its exit code.
+   - Output contains `audio tracks` → State Inserted, Kind AudioCD.
+   - Otherwise, if Kind was CD → Kind Data.
+   - Otherwise, if State was Empty → it stays Empty.
+4. Return the Disc. DVD/BD **data** discs stay DVD/BluRay; this is a known limitation.
 
 ### 3.3 Engine loop (`engine.Run`)
 
-`Run` uses `ticker := time.NewTicker(cfg.PollInterval)` and runs one **pass** immediately,
-then one per tick, until `ctx.Done()`. A pass:
+**At start**
+- `Output.CleanStaging()`: remove `<kind>/.staging` for every kind dir (leftovers from a crash).
+- Create a ticker: `time.NewTicker(cfg.PollInterval)`.
+- Run one pass immediately, then one pass per tick, until `ctx.Done()`; then return `nil`.
 
-1. State = detecting. Call `Detect(ctx)`.
-2. On error or `StateUnknown`: `bad++`; log WARN with `err` and `raw`. If `bad >= BadThreshold`:
-   state ejecting → `Eject` (with `ctx`; errors logged) → `notifyDetached(Stopped, "Ripper stopped", "too many bad detector responses")`
-   → state stopped → return `ErrTooManyBadResponses`. Otherwise state idle; end the pass (**no eject**, D3).
-3. Otherwise `bad = 0`.
-4. `Empty`, `Open`, `Loading` → log INFO `"no disc"` / `"tray open"` / `"disc loading"` → state idle → end the pass.
-5. `Inserted` → run the **rip plan** for `(Mode, Kind)` from §3.4. State ripping; `StartedAt = Now()`.
-6. Each step of the plan: `dir := Output.Prepare(k, label, Now())` (§3.5), where `k` is the
-   disc's Kind for a kind step and `disc.KindData` for every ISO step (also used for
-   `Finalize`). Then
-   `err := ripper.Rip(ctx, d, dir)`.
-   - If `ctx.Err() != nil` (shutdown): `cleanup(dir)` using
-     `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`, record outcome `cancelled`,
-     `notifyDetached(Stopped, "Ripper stopped", "shutdown during rip of <label>")`, **do not eject**,
-     return `nil`.
-   - If `err != nil`: record outcome `failure`, `cleanup(dir)`, skip the remaining steps.
-   - Else `Output.Finalize(kind, dir)` (§3.5).
-7. After the plan: state ejecting.
-   - If `EjectEnabled`: `Eject(ctx)`. An error is logged at ERROR; continue.
-   - Else state waiting_for_eject: log INFO `"safe to eject"`; then every `ManualEjectPoll`
-     call `Detect`. Stop waiting when State is Empty or Open. Errors are ignored and do not
-     count toward `bad`. Respect `ctx.Done()` (return `nil`).
-8. Notify: `Success` if every step succeeded, otherwise `Failure` (texts in §3.7). Then state idle.
+**Each pass**
 
-`notifyDetached` = `Notify(context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second), e)`.
-Its errors are logged at WARN and never change the outcome.
+1. Set state to detecting. Call `Detect(ctx)`.
+2. **Detect error, or `StateUnknown`:**
+   - `bad++`; log WARN with `err` and `raw`.
+   - When `bad` first reaches `BadThreshold`: `notifyDetached(Failure, "Drive not responding", err)`.
+   - While `bad >= BadThreshold`, `Ready` returns an error.
+   - Keep `awaitingRemoval` unchanged, set state to idle (or awaiting_removal), end the pass.
+   - Never eject here, and never exit.
+3. Otherwise set `bad = 0`.
+4. **If `awaitingRemoval`:**
+   - State Empty or Open → clear the flag, log INFO `"disc removed"`, set state idle, end the pass.
+   - Anything else → log DEBUG `"waiting for disc removal"`, set state awaiting_removal, end the pass.
+5. **State Empty, Open or Loading** → log DEBUG, set state idle, end the pass.
+6. **State Inserted:** set state ripping, `StartedAt = Now()`, then run the rip plan (§3.4) step by step.
+   For each step:
+   - `dir, err := Output.Prepare(kindDir, d.Label, Now())`.
+   - `err = ripper.Rip(ctx, d, dir)`.
+   - If `ctx.Err() != nil` (shutdown):
+     - `Output.Cleanup(dir)` using `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`;
+     - record outcome `cancelled`;
+     - `notifyDetached(Stopped, "Ripper stopped", "shutdown during rip of <label>")`;
+     - **do not eject**; return `nil`.
+   - If `err != nil`: `Output.Cleanup(dir)`, record outcome `failure`, skip the remaining steps.
+   - Else: `path, err := Output.Finalize(kindDir, dir)`. Append `path` to the result. A Finalize
+     error counts as `failure`.
+7. **After the plan:**
+   - If `cfg.Eject`: set state ejecting and call `Eject(ctx)`. An error is logged at ERROR and does
+     not change the outcome.
+   - If `!cfg.Eject`: log INFO `"safe to eject"`.
+   - Either way set `awaitingRemoval = true` and state awaiting_removal. This flag is what stops
+     a disc being re-ripped every tick when the eject fails, when ejecting is off, or after a failure.
+8. Notify `Success` if every step succeeded; `Failure` if any step failed. A plan that is only
+   skipped steps sends no notification.
 
-### 3.4 Rip plan per mode and kind
+`notifyDetached(e)` calls `Notify(ctx', e)`, where `ctx'` is
+`context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)`. Its errors are logged at WARN
+and never change the outcome. All notifications are sent sequentially from the engine goroutine.
 
-| Kind | ModeNormal | ModeJustISO | ModeAlsoISO |
+### 3.4 Rip plan (`ISOMode` × Kind)
+
+| Kind | `off` | `also` | `only` |
 |---|---|---|---|
-| BluRay | Rippers[BluRay] | ISO | Rippers[BluRay], then ISO |
-| DVD | Rippers[DVD] | ISO | Rippers[DVD], then ISO |
-| AudioCD | Rippers[AudioCD] | *skip*: WARN "audio CDs cannot be imaged", outcome `skipped` | Rippers[AudioCD] only; WARN "ISO skipped for audio CD" |
-| Data | ISO | ISO | ISO (once) |
+| BluRay | Video→`BluRay` | Video→`BluRay`, ISO→`DATA` | ISO→`DATA` |
+| DVD | Video→`DVD` | Video→`DVD`, ISO→`DATA` | ISO→`DATA` |
+| AudioCD | Audio→`CD` | Audio→`CD`; WARN "ISO skipped for audio CD" | *skip*: WARN "audio CDs cannot be imaged"; outcome `skipped` |
+| Data | ISO→`DATA` | ISO→`DATA` (once) | ISO→`DATA` |
+
+`X→Dir` means: call ripper X with a staging dir under kind dir `Dir`.
 
 ### 3.5 Output (`internal/output`)
 
 ```go
-type Planner struct{ /* storage roots, timestamp flag, separate-finish flag, owner, mode */ }
+type Settings struct {
+	OutputDir string
+	UID, GID  int         // -1 = unchanged
+	Umask     fs.FileMode // e.g. 0o002
+}
 
-func NewPlanner(cfg Settings) (*Planner, error)
-func (p *Planner) Prepare(k disc.Kind, label string, now time.Time) (dir string, err error)
-func (p *Planner) Finalize(k disc.Kind, dir string) error
+func NewPlanner(s Settings) (*Planner, error)                   // os.OpenRoot(OutputDir); creates the 4 kind dirs
+func (p *Planner) CleanStaging() error
+func (p *Planner) Prepare(kindDir, label string, now time.Time) (dir string, err error)
+func (p *Planner) Finalize(kindDir, dir string) (path string, err error)
 func (p *Planner) Cleanup(ctx context.Context, dir string) error
+func (p *Planner) Close() error
+
+const (
+	DirBluRay = "BluRay"
+	DirDVD    = "DVD"
+	DirCD     = "CD"
+	DirData   = "DATA"
+)
 ```
 
-- **Root per kind:** BluRay → `STORAGE_BD`; DVD → `STORAGE_DVD`; AudioCD → `STORAGE_CD`;
-  Data and every ISO step → `STORAGE_DATA`.
-- **Sanitise label:** replace every rune not in `[A-Za-z0-9 ._-]` with `_`; trim leading/trailing
-  space and `.`; truncate to 100 bytes. If empty → `disc_<YYYYMMDD_HHMMSS>`.
-- **Name:** `TIMESTAMPPREFIX` → `<YYYYMMDD_HHMMSS>_<label>`, else `<label>`. If `<root>/<name>`
-  already exists, append `_<YYYYMMDD_HHMMSS>`. If it still exists, append `_2`, `_3`, …
-- **Prepare** returns `<root>/<name>` (created with `MkdirAll`, mode 0o755). The one
-  exception is AudioCD, which returns the staging dir `<STORAGE_CD>/.ripper-staging-<YYYYMMDD_HHMMSS>`.
-- **ISO file name:** the ddrescue backend writes `<dir>/<base(dir)>.iso`.
+- **One root.** Every filesystem call goes through the single `os.Root` opened at `OutputDir`
+  (`Root.MkdirAll`, `Root.Rename`, `Root.RemoveAll`, `Root.Lchown`, `Root.Chmod`, `Root.Stat`).
+  No label can escape it.
+- **Sanitise:** replace every rune not in `[A-Za-z0-9 ._-]` with `_`; trim leading/trailing spaces
+  and dots; truncate to 100 bytes. If the result is empty, use `disc_<YYYYMMDD_HHMMSS>`.
+- **Prepare:** returns the absolute path of `<kindDir>/.staging/<YYYYMMDD_HHMMSS>/<name>`, created
+  with mode 0o777 (the umask applies). `<name>` is the sanitised label, so the ISO backend can name
+  its files `<name>.iso` / `<name>.map`.
 - **Finalize:**
-  - BluRay/DVD with `SEPARATERAWFINISH`: rename `<root>/<name>` → `<root>/finished/<name>`
-    (`MkdirAll` the parent).
-  - AudioCD: rename each child of staging except `.wav` into `<STORAGE_CD>/`, using the
-    collision rule above, then remove staging.
-  - Then chown + chmod the final path recursively (§5.4).
-- **Cleanup:** `RemoveAll(dir)`.
-- **All filesystem operations** go through `os.OpenRoot(root)` (`Root.MkdirAll`, `Root.Rename`,
-  `Root.RemoveAll`, `Root.Chown`, `Root.Chmod`) so no label can escape the storage root.
+  - **BluRay/DVD/DATA:** the target is `<kindDir>/<name>`. If that exists, use `<name>_<YYYYMMDD_HHMMSS>`.
+    If that also exists, fail with an error. Then one `Root.Rename(staging, target)`, then remove
+    `<kindDir>/.staging/<ts>`.
+  - **CD:** move each child of the staging dir except `.wav` to `CD/<child>`, using the same
+    collision rule. Then remove `CD/.staging/<ts>`. The returned path is the first moved child.
+  - Then apply ownership and permissions recursively to each finalized path (§5.4).
+  - Staging lives inside its kind dir, so a rename never crosses a mount (no `EXDEV` when kind dirs
+    are separate bind mounts).
+- **Cleanup:** `Root.RemoveAll(<kindDir>/.staging/<ts>)`.
 
 ### 3.6 Commands (exact argv)
 
@@ -434,120 +423,131 @@ func (p *Planner) Cleanup(ctx context.Context, dir string) error
 |---|---|---|
 | detect | `makemkvcon` | `-r --cache=1 info disc:9999` |
 | audio check | `cdparanoia` | `-d <DRIVE> -Q` |
-| BD/DVD rip | `makemkvcon` | `--profile=<profilePath> -r --decrypt --minlength=<MINIMUMLENGTH> mkv disc:<Index> all <dir>` |
-| audio rip | `abcde` | `-d <DRIVE> -c <perRipConf> -N -l` (**no `-x`**: the engine is the only ejector, D22) |
-| ISO | `ddrescue` | `<DRIVE> <dir>/<base(dir)>.iso` |
-| eject | `eject` | `-v <DRIVE>`; on error: wait 2 s, `sdparm --command=unlock <DRIVE>`, wait 1 s, `sdparm --command=eject <DRIVE>` (return the last error) |
+| BluRay/DVD rip | `makemkvcon` | `--profile=<profilePath> -r --decrypt --minlength=<MIN_TITLE_LENGTH> mkv disc:<Index> all <dir>` |
+| audio rip | `abcde` | `-d <DRIVE> -c <perRipConf> -N -l` (no `-x`; the engine is the only ejector) |
+| ISO | `ddrescue` | `<DRIVE> <dir>/<base(dir)>.iso <dir>/<base(dir)>.map` |
+| eject | `eject` | `-v <DRIVE>`. On error: wait 2 s, `sdparm --command=unlock <DRIVE>`, wait 1 s, `sdparm --command=eject <DRIVE>`; return the last error |
 | register | `makemkvcon` | `reg <KEY>` |
 
-- **abcde per-rip config:** write a temp file containing the base conf (`$CONFIG_DIR/abcde.conf`
-  if it exists, else the embedded default), followed by
-  `\n# ripper overrides\nOUTPUTDIR=<dir>\nWAVOUTPUTDIR=<dir>/.wav\nEJECTCD=n\n`. Delete it after the rip.
-- **profilePath:** `$CONFIG_DIR/default.mmcp.xml` if it exists; else the embedded default,
-  written once at startup to `os.MkdirTemp("", "ripper-")`.
+- **profilePath:** `<CONFIG_DIR>/default.mmcp.xml` if it exists. Otherwise the embedded default,
+  written once by `rip/makemkv.New` to `os.MkdirTemp("", "ripper-")`.
+- **perRipConf:** a temp file containing the base conf (`<CONFIG_DIR>/abcde.conf` if it exists,
+  else the embedded default), followed by
+  `\n# ripper overrides\nOUTPUTDIR=<dir>\nWAVOUTPUTDIR=<dir>/.wav\nEJECTCD=n\n`.
+  Delete it after the rip.
+- The base files are resolved once, at construction. Restart to pick up edits.
 
 ### 3.7 Notifications
 
 | Kind | Title | Body |
 |---|---|---|
-| Success | `Ripped <label>` | `<kind> → <final dir>` |
-| Failure | `Rip failed: <label>` | the error string |
+| Success | `Ripped <label>` | `<kind> → <paths joined by ", ">` |
+| Failure | `Rip failed: <label>` / `Drive not responding` | the error string |
 | Stopped | `Ripper stopped` | the reason |
 
-`notify/apprise` maps Success → `apprise.NotifySuccess`, Failure → `NotifyFailure`,
-Stopped → `NotifyWarning`. The patchbay selects `notify/nop` when `APPRISE_URLS` is empty.
+- `notify/apprise` maps Success → `apprise.NotifySuccess`, Failure → `NotifyFailure`,
+  Stopped → `NotifyWarning`.
+- The patchbay selects `notify/nop` when `AppriseURLs` is empty.
+- For automation after a rip (moving files, triggering Plex, …) point an apprise `json://` or
+  `form://` target at it. This replaces the old hook scripts.
 
-### 3.8 Startup sequence (`ripper serve`, before `lifecycle.Run`)
+### 3.8 Startup (`ripper serve`, before `lifecycle.Run`)
 
-1. Load + validate config (§1). On failure print the joined error and exit 1.
-2. `obs.Setup` with `ServiceName: "ripper"`, `ServiceVersion: buildinfo.Version()`,
-   `LogLevel: cfg.LogLevel`, `LogOutput: tee` (§6.1).
-3. Warn on removed variables (§1.2).
-4. MakeMKV key: `env` source if `KEY` is set, else `forum`. On error, log WARN and skip steps 5–6.
-5. `settings.conf` in `<UserHomeDir>/.MakeMKV/`: create the dir with mode 0700; read the lines;
-   replace the line starting with `app_Key` or append `app_Key = "<key>"`; write with mode 0600.
-   Keep every other line.
-6. `Run(makemkvcon reg <key>)`; an error logs WARN and startup continues.
-7. Resolve `profilePath` and the abcde base conf (§3.6).
-8. `patchbay.Backends` → `patchbay.Spec` → `lifecycle.Run`.
+1. Load and validate config (§1). On failure, print the joined error and exit 1.
+2. Call `syscall.Umask(int(cfg.Umask))` (Linux), before any file is created.
+3. `logring.New(2000)`; `obs.Setup` with `ServiceName: "ripper"`, `ServiceVersion: version()`,
+   `LogLevel`, and `LogOutput: io.MultiWriter(os.Stdout, ring)`.
+4. Get the key: `cfg.MakeMKVKey`, or if that's empty, `makemkvkey.FetchBetaKey(ctx, client, makemkvkey.ForumURL)`
+   (client per §5.5). `os.MkdirAll(<home>/.MakeMKV, 0o700)`. Then `makemkvkey.Register`.
+   Any error here: log WARN and continue.
+5. `patchbay.Backends` → `patchbay.Spec` → `lifecycle.Run`.
 
-The MakeMKV key is only ever logged via `obs.RedactAttr("key", k)`. Apprise URLs are never logged.
+Never log the key, the apprise URLs, or the web password. `execrunner` never logs argv (§5.1),
+so `makemkvcon reg <key>` is safe to run through it.
 
 ---
 
 ## 4. HTTP
 
-`P` = normalised `WEB_PATH_PREFIX`. Every route on the API listener is registered with
-`P` prepended. huma operations use `Path: P + "/api/v1/…"`; raw handlers use
-`api.RawRoute("<METHOD> " + P + "/…", h)`. **Never** wrap the handler in `http.StripPrefix`
-as middleware; it breaks otelhttp's route labels.
+`P` is the normalised `RIPPER_WEB_PATH_PREFIX`.
+- Every route on the API listener is registered with `P` prepended: huma operations use
+  `Path: P + "/api/v1/…"`, raw handlers use `api.RawRoute("<METHOD> " + P + "/…", h)`.
+- **Never** wrap the listener in `http.StripPrefix` as middleware. It breaks otelhttp route labels.
 
-### 4.1 API listener (`API_ADDR`)
+### 4.1 API listener (`RIPPER_API_ADDR`)
 
 | Pattern | When | Handler | Success | Errors |
 |---|---|---|---|---|
-| `GET P/api/v1/status` | always | huma, OperationID `getStatus`, Tag `status` | 200 `engine.Status` | — |
-| `GET P/api/v1/log` | always | huma, OperationID `getLog`, Tag `log`; query `lines` int default 100, min 1, max 1000 | 200 `LogResponse` | 422 (huma validation) |
-| `DELETE P/api/v1/log` | always | huma, OperationID `clearLog`, Tag `log`; `os.Truncate(LOG_FILE, 0)` | 204 | 500 problem |
-| `GET P/openapi.json` | docs | raw; `api.Huma.OpenAPI().MarshalJSON()` | 200 `application/json` | — |
-| `GET P/openapi.yaml` | docs | raw; `api.Huma.OpenAPI().YAML()` | 200 `application/yaml` | — |
-| `GET P/docs` | docs | raw; Scalar HTML (§4.4) | 200 | — |
-| `GET P/docs/assets/` | docs | raw; `http.StripPrefix(P+"/docs/assets/", http.FileServerFS(scalarFS))` | 200 | 404 |
-| `GET P/{$}` | !headless | raw; UI `index.html` with CSP nonce (§4.4), `Cache-Control: no-store` | 200 | — |
+| `GET P/api/v1/status` | always | huma; OperationID `getStatus`, Tag `status` | 200 `engine.Status` | — |
+| `GET P/api/v1/log` | always | huma; OperationID `getLog`, Tag `log`; query `lines` int, default 200, min 1, max 2000 | 200 `LogResponse` | 422 |
+| `GET P/openapi.json` | always | raw; `api.Huma.OpenAPI().MarshalJSON()` | 200 `application/json` | — |
+| `GET P/openapi.yaml` | always | raw; `api.Huma.OpenAPI().YAML()` | 200 `application/yaml` | — |
+| `GET P/docs` | always | raw; Scalar HTML (§4.4) | 200 | — |
+| `GET P/docs/assets/` | always | raw; `http.StripPrefix(P+"/docs/assets/", http.FileServerFS(scalarFS))` | 200 | 404 |
+| `GET P/{$}` | !headless | raw; UI `index.html` with a CSP nonce (§4.4), `Cache-Control: no-store` | 200 | — |
 | `GET P/assets/` | !headless | raw; `http.StripPrefix(P+"/assets/", http.FileServerFS(uiAssets))`, `Cache-Control: public, max-age=31536000, immutable` | 200 | 404 |
 | `GET P/favicon.ico` | !headless | raw | 200 | — |
 | `GET P` | P ≠ "" | raw; 301 → `P/` | — | — |
-| `GET /{$}` | P ≠ "" or headless | raw; 302 → `P/` (UI) or `P/docs` (headless + docs). Not registered if headless and no docs. | — | — |
-
-`kit httpapi.Options`: `DocsEnabled: false` (ripper serves its own docs), plus `Title: "ripper"`,
-`Version`, `Logger`, `TracerProvider`, `MeterProvider`, and `Middleware` (outermost first):
-1. `http.NewCrossOriginProtection().Handler` (CSRF guard for `DELETE`);
-2. basic auth (§4.3) when credentials are configured.
+| `GET /{$}` | P ≠ "" or headless | raw; 302 → `P/` (UI) or `P/docs` (headless) | — | — |
 
 ```go
 type LogResponse struct {
-	Lines []string `json:"lines"` // raw lines, newest first
-	Size  int64    `json:"size"`  // bytes
-	Large bool     `json:"large"` // size > 1_000_000
+	Lines []string `json:"lines"` // raw JSON log records, newest first
 }
 ```
 
-Tail algorithm: open the file; seek from EOF in 64 KiB chunks until N newlines are found
-or the start is reached; split; reverse. A missing file returns `{lines: [], size: 0}`.
+`httpapi.Options` for the kit:
+- `DocsEnabled: false` (ripper serves its own docs), `Title: "ripper"`, `Version`, `Logger`,
+  `TracerProvider`, `MeterProvider`;
+- `Middleware`, outermost first: `http.NewCrossOriginProtection().Handler`, then basic auth (§4.3)
+  when credentials are set.
 
-### 4.2 Admin listener (`ADMIN_ADDR`)
+### 4.2 Admin listener (`RIPPER_ADMIN_ADDR`)
 
-`httpapi.NewAdmin(AdminOptions{Addr, Readiness: ready, Registry: p.PromRegistry, PprofEnabled, Logger})`.
-`ready := httpapi.NewReadiness()`;
-`ready.Register("drive", func(ctx) error { _, err := os.Stat(cfg.Drive); return err })`.
-Pass the same `ready` to `lifecycle.Spec.Readiness`. No auth on admin.
+```go
+ready := httpapi.NewReadiness()
+ready.Register("drive", func(ctx context.Context) error { _, err := os.Stat(cfg.Drive); return err })
+ready.Register("detector", eng.Ready)
+```
 
-### 4.3 Basic auth middleware
+Build the admin server with `httpapi.NewAdmin(AdminOptions{Addr, Readiness: ready, Registry: p.PromRegistry, Logger})`.
+Pass the same `ready` as `lifecycle.Spec.Readiness`. pprof is off. The admin listener has no auth.
 
-Enabled iff `WEB_USERNAME` and `WEB_PASSWORD` are both non-empty. `u, p, ok := r.BasicAuth()`.
-Compare `sha256.Sum256` of each against the configured values with `subtle.ConstantTimeCompare`.
-On failure: `w.Header().Set("WWW-Authenticate", `Basic realm="Ripper", charset="UTF-8"`)` then
-`httpapi.WriteProblem(w, http.StatusUnauthorized, "authentication required", httpapi.ProblemOptions{})`.
-Never call `r.WithContext` or otherwise clone the request.
+### 4.3 Basic auth middleware (in `internal/api`)
+
+- Enabled iff both `RIPPER_WEB_USERNAME` and `RIPPER_WEB_PASSWORD` are non-empty.
+- `u, p, ok := r.BasicAuth()`. Compare `sha256.Sum256` of each value against the configured ones
+  with `subtle.ConstantTimeCompare`.
+- On failure: `w.Header().Set("WWW-Authenticate", `Basic realm="Ripper", charset="UTF-8"`)`, then
+  `httpapi.WriteProblem(w, http.StatusUnauthorized, "authentication required", httpapi.ProblemOptions{})`.
+- Never clone the request (no `r.WithContext`).
 
 ### 4.4 Content-Security-Policy (exact)
 
-- **UI index:** `default-src 'none'; script-src 'self'; style-src 'self' 'nonce-<N>'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
-  `<N>` = 16 random bytes, base64 (`crypto/rand`), new on every response. The server replaces the
-  placeholder `__CSP_NONCE__` in `index.html` with `<N>`; it appears in `<meta name="csp-nonce" content="__CSP_NONCE__">`.
-- **Scalar `/docs`:** `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
-- Both also set `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+**UI index:**
+```
+default-src 'none'; script-src 'self'; style-src 'self' 'nonce-<N>'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+```
+- `<N>` is 16 bytes from `crypto/rand`, base64-encoded, new for every response.
+- The server replaces `__CSP_NONCE__` in `index.html`
+  (`<meta name="csp-nonce" content="__CSP_NONCE__">`) with `<N>`.
 
-The Scalar page (`internal/apidocs/assets/docs.html`) loads `assets/standalone.js` and then
-`assets/docs-init.js`. `docs-init.js` calls `Scalar.createApiReference('#app', {url: './openapi.json',
-withDefaultFonts: false, telemetry: false, hideTestRequestButton: true, hideClientButton: true})`.
-The page uses no inline script.
+**Scalar `/docs`:**
+```
+default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+```
+
+Both also set `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+
+**Scalar page** (`internal/apidocs/assets/docs.html`):
+- Loads `assets/standalone.js` and then `assets/docs-init.js`. No inline script.
+- `docs-init.js` calls `Scalar.createApiReference('#app', {url: './openapi.json', withDefaultFonts: false, telemetry: false, hideTestRequestButton: true, hideClientButton: true})`.
 
 ---
 
-## 5. Process and filesystem primitives
+## 5. Primitives
 
-### 5.1 `execrunner` (Linux only: file `execrunner_linux.go`)
+### 5.1 `execrunner` (Linux only: `execrunner_linux.go`)
 
 ```go
 cmd := exec.CommandContext(ctx, c.Name, c.Args...)
@@ -560,7 +560,7 @@ cmd.Cancel = func() error {
 	return err
 }
 cmd.WaitDelay = 5 * time.Second
-lw := newLineWriter(r.logger, c.Tool) // io.Writer; splits on '\n'; flush on Close; lines > 64 KiB are split
+lw := newLineWriter(r.logger, c.Tool) // io.Writer; splits on '\n'; flushes on Close; lines over 64 KiB are split
 cmd.Stdout, cmd.Stderr = lw, lw       // never StdoutPipe
 err := cmd.Run()
 lw.Close()
@@ -569,12 +569,12 @@ if ctx.Err() != nil && cmd.Process != nil {
 }
 ```
 
-Error mapping:
-- `ctx.Err() != nil` → return `fmt.Errorf("%s: %w", c.Tool, ctx.Err())`.
-- `*exec.ExitError` (via `errors.AsType`) → `&ExitError{Tool, Code: ee.ExitCode()}`.
-- Anything else → wrap with the tool name.
-
-Each log line: `logger.Info("tool output", "tool", c.Tool, "line", line)`.
+- Log a DEBUG `"exec"` record with `tool` before running. Argv is **not** logged at any level.
+- Each output line → `logger.Info("tool output", "tool", c.Tool, "line", line)`.
+- Errors:
+  - `ctx.Err() != nil` → `fmt.Errorf("%s: %w", c.Tool, ctx.Err())`;
+  - `*exec.ExitError` (`errors.AsType`) → `&runner.ExitError{Tool, Code: ee.ExitCode()}`;
+  - anything else → wrapped with the tool name.
 
 ### 5.2 Apprise wrapper
 
@@ -595,40 +595,51 @@ func (n *Notifier) Notify(ctx context.Context, e notify.Event) error {
 }
 ```
 
-The engine calls `Notify` sequentially (apprise-go keeps package-level HTTP state; never call it
-concurrently). Build the client once: `a := apprise.New(); err := a.AddAll(urls...)`.
+- Build the client once: `a := apprise.New(); err := a.AddAll(urls...)`.
+- Never call `Send` concurrently; apprise-go keeps package-level HTTP state.
 
 ### 5.3 Exit codes (`cli.Execute(ctx) int`)
 
-`0` success; `1` runtime or config error; `2` usage error. Root command: `SilenceUsage: true`,
-`SilenceErrors: true`. The error is printed to stderr once. `main`:
-`os.Exit(cli.Execute(context.Background()))`. `serve` passes the context to `lifecycle.Run`, which
-owns SIGTERM/SIGINT. `detect` and `healthcheck` wrap their context in `signal.NotifyContext`.
+- `0` success; `1` runtime or config error; `2` usage error.
+- Root command: `SilenceUsage: true`, `SilenceErrors: true`. Print the error to stderr once.
+- `main` is `os.Exit(cli.Execute(context.Background()))`.
+- `serve`: `lifecycle.Run` owns SIGTERM/SIGINT.
+- `detect` and `healthcheck`: use `signal.NotifyContext`.
 
-### 5.4 Mode and ownership
+### 5.4 Permissions and ownership (`output`)
 
-- **`ParseMode(s string) (func(fs.FileMode, isDir bool) fs.FileMode, error)`**
-  - Grammar: octal `^0?[0-7]{3,4}$`, or clauses separated by `,`, each `[ugoa]*[-+=][rwxX]*`.
-  - Empty who = `a`. Umask is ignored (deviation D25).
-  - `X` adds execute only to directories, or to files that already have any execute bit.
-  - Table tests: `g+rw`, `u=rwx,g=rx,o=`, `a+X`, `0775`, `775`; invalid: `g+q`, `z+r`, ``.
-- **Ownership:** `user.Lookup(FILEUSER)` → uid; on `user.UnknownUserError` use `FILEUSERID`.
-  Same for the group via `user.LookupGroup` / `FILEGROUPID`. Apply recursively with
-  `Root.Lchown` + `Root.Chmod` (directories and files) to the finalized path only (D26).
+Let `u` be the umask.
+- **Directories:** `0o777 &^ u`.
+- **Files:** `0o777 &^ u` if the file already has any execute bit, else `0o666 &^ u`.
+- Never add execute to a file.
+- Apply recursively to each finalized path with `Root.Chmod`. Then, if `UID >= 0 || GID >= 0`,
+  call `Root.Lchown(path, UID, GID)` (−1 leaves that part unchanged).
 
----
+### 5.5 Outbound client for the key fetch
 
-## 6. Logging and build info
+```go
+// MakeMKV forum: public page, fetched once per process start; no API, no published quota.
+// One attempt at 1 rps: a failed fetch only skips registration.
+c, err := outbound.New(outbound.Config{Product: "ripper", Version: version(),
+	ContactURL: "https://github.com/jacaudi/docker-ripper", Timeout: 15 * time.Second,
+	RequestsPerSecond: 1, Burst: 1, MaxAttempts: 1})
+```
 
-### 6.1 Log tee
+- `FetchBetaKey`: GET the url; regex `T-[\w@]{66}`; return the first match; no match →
+  `errors.New("makemkvkey: no beta key found")`.
+- Known limitation: the key is fetched once per process start. A long-running container needs a
+  restart after the beta key rotates. The weekly image rebuild plus `restart: unless-stopped`
+  covers this.
 
-Open `LOG_FILE` with `O_WRONLY|O_CREATE|O_APPEND`, mode 0644. `LogOutput = io.MultiWriter(os.Stdout, bestEffort{f})`,
-where `bestEffort.Write` always returns `len(p), nil` and logs a file error once to stderr.
-Every record is JSON (kit `obs`). Ripper adds these attribute keys:
-`tool`, `line`, `state`, `disc_kind`, `disc_label`, `dir`, `outcome`, `err`.
+### 5.6 `ripper detect`
 
-### 6.2 Version
+- Builds `execrunner` + `detect/makemkv`, calls `Detect`, and prints the `disc.Disc` as indented JSON to stdout.
+- Exit 0 for any State, including Empty. Exit 1 on a detect error (the error goes to stderr).
+- `--raw` also prints the raw `makemkvcon` output, then the raw `cdparanoia -Q` output, each under a
+  `--- <tool> ---` header. This is how hardware fixtures are captured.
 
-`internal/buildinfo.Version()` returns `debug.ReadBuildInfo().Main.Version` (stamped from the git
-tag since Go 1.24; `(devel)` otherwise) plus `vcs.revision` (short) when present. No `-ldflags -X`.
-Docker builds must include `.git` in the build context (do not list it in `.dockerignore`).
+### 5.7 Version
+
+`version()` lives in `internal/cli/version.go`. It returns `debug.ReadBuildInfo().Main.Version`
+(stamped from the git tag) plus the short `vcs.revision` when present. Do not use `-ldflags -X`.
+Docker builds must include `.git` in the build context.

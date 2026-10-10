@@ -60,12 +60,6 @@ tasks:
     deps: [tools]
     cmds: ['{{.BIN}}/govulncheck ./...']
 
-  parity:
-    desc: Parity suite in a container (see testing.md)
-    cmds:
-      - docker build -f test/parity/Dockerfile -t ripper-parity .
-      - docker run --rm ripper-parity
-
   ui:deps:
     dir: web
     sources: [package.json, package-lock.json]
@@ -111,7 +105,7 @@ tasks:
       - docker build -f manual-build/Dockerfile -t ripper:dev-manual .
 
   check:
-    desc: Everything CI runs on a PR, except parity and image
+    desc: Everything CI runs on a PR, except the image build
     cmds:
       - task: lint
       - task: test
@@ -339,7 +333,7 @@ documented in the PR template.)
 
 | File | Triggers | Jobs |
 |---|---|---|
-| `ci.yml` | pull_request, push main | `pr-title` (PRs only), `go` (`task lint test vuln`), `ui` (`task ui:lint ui:test ui:build` + `git diff --exit-code web/src/api/schema.d.ts`), `parity` (`task parity`), `image` (build both images + Trivy; no push) |
+| `ci.yml` | pull_request, push main | `pr-title` (PRs only), `go` (`task lint test vuln`; includes the e2e smoke), `ui` (`task ui:lint ui:test ui:build` + `git diff --exit-code web/src/api/schema.d.ts`), `image` (build both images + Trivy; no push) |
 | `security.yml` | pull_request, push main, weekly | CodeQL (go, javascript-typescript), OSV-Scanner, Scorecard (push/weekly only) |
 | `release.yml` | push main | release-please → publish on release |
 | `rebuild.yml` | weekly, dispatch | rebuild + push the latest release |
