@@ -30,7 +30,7 @@ Module path: `github.com/jacaudi/docker-ripper`. All packages below live under i
 
 | Env | viper key / Go field | Type | Default | Validation / meaning |
 |---|---|---|---|---|
-| `RIPPER_DRIVE` | `drive` / `Drive` | string | `/dev/sr0` | non-empty, absolute |
+| `RIPPER_DRIVES` | `drives` / `Drives` | []string (comma-sep) | `/dev/sr0` | ≥ 1 entry; each absolute; basenames unique (the basename is the **drive ID**, e.g. `sr0`) |
 | `RIPPER_OUTPUT_DIR` | `output_dir` / `OutputDir` | string | `/out/Ripper` | absolute. Fixed subdirs `BluRay/ DVD/ CD/ DATA/` |
 | `RIPPER_CONFIG_DIR` | `config_dir` / `ConfigDir` | string | `/config` | absolute. Optional overrides `abcde.conf`, `default.mmcp.xml` |
 | `RIPPER_EJECT` | `eject` / `Eject` | bool | `true` | `false` = leave the disc for manual removal |
@@ -50,7 +50,10 @@ Module path: `github.com/jacaudi/docker-ripper`. All packages below live under i
 | `RIPPER_WEB_USERNAME` | `web_username` / `WebUsername` | string | `""` | both-or-neither with the password |
 | `RIPPER_WEB_PASSWORD` | `web_password` / `WebPassword` | string | `""` | both-or-neither with the username |
 
-Constants (not configurable): detect timeout 30 s; bad-response threshold 5; log ring 2000 records.
+Constants (not configurable): detect timeout 30 s; drive-scan cache 5 s; bad-response threshold 5 (per drive); log ring 2000 records.
+
+**Drive ID** = `filepath.Base(device)` (`/dev/sr0` → `sr0`). It appears in staging paths, the API,
+readiness check names, metric labels, log records and notification titles.
 
 ### 1.3 `RIPPER_WEB_PATH_PREFIX` normalisation
 
@@ -192,8 +195,8 @@ type Notifier interface {
 
 | Package | Constructor / API | Implements |
 |---|---|---|
-| `internal/runner/execrunner` | `New(logger *slog.Logger) *Runner` | `runner.Runner` |
-| `internal/detect/makemkv` | `New(r runner.Runner, device string, timeout time.Duration) *Detector`; `func ParseDRV(out []byte, device string) (disc.Disc, error)`; `ErrNoDriveLine`, `ErrMalformed` | `detect.Detector` |
+| `internal/runner/execrunner` | `New(logger *slog.Logger, tracer trace.Tracer, meter metric.Meter) (*Runner, error)` | `runner.Runner` |
+| `internal/detect/makemkv` | `NewScanner(r runner.Runner, timeout time.Duration) *Scanner` (one per process, shared by all drives); `New(s *Scanner, r runner.Runner, device string) *Detector`; `func ParseDRV(out []byte, device string) (disc.Disc, error)`; `ErrNoDriveLine`, `ErrMalformed` | `detect.Detector` |
 | `internal/rip/makemkv` | `New(r runner.Runner, configDir string, minLength int) (*Ripper, error)`; embeds `default.mmcp.xml` | `rip.Ripper` |
 | `internal/rip/abcde` | `New(r runner.Runner, device, configDir string) (*Ripper, error)`; embeds `abcde.conf` | `rip.Ripper` |
 | `internal/rip/ddrescue` | `New(r runner.Runner, device string) *Ripper` | `rip.Ripper` |
@@ -235,19 +238,24 @@ const (
 
 const BadThreshold = 5
 
+// Deps for ONE drive. Detect, Video, Audio, ISO and Eject are built per drive;
+// Notify, Output, Logger, Tracer and Metrics are shared by every engine.
 type Deps struct {
-	Detect detect.Detector
-	Video  rip.Ripper // BluRay and DVD
-	Audio  rip.Ripper // audio CD
-	ISO    rip.Ripper // ddrescue
-	Eject  eject.Ejector
-	Notify notify.Notifier
-	Output *output.Planner
-	Logger *slog.Logger
-	Now    func() time.Time // time.Now in prod
+	Detect  detect.Detector
+	Video   rip.Ripper // BluRay and DVD
+	Audio   rip.Ripper // audio CD
+	ISO     rip.Ripper // ddrescue
+	Eject   eject.Ejector
+	Notify  notify.Notifier
+	Output  *output.Planner
+	Logger  *slog.Logger
+	Tracer  trace.Tracer
+	Metrics *Metrics // §6.2 instruments, created once by the patchbay
+	Now     func() time.Time // time.Now in prod
 }
 
 type Config struct {
+	Drive        string // drive ID, e.g. "sr0"
 	ISOMode      ISOMode
 	Eject        bool
 	PollInterval time.Duration
@@ -261,6 +269,8 @@ func (e *Engine) Status() Status                  // safe for concurrent use
 func (e *Engine) Ready(ctx context.Context) error // readiness check "detector": error iff bad ≥ BadThreshold
 
 type Status struct {
+	Drive           string      `json:"drive"` // drive ID
+	Device          string      `json:"device"`
 	State           State       `json:"state"`
 	Disc            *disc.Disc  `json:"disc,omitempty"`
 	StartedAt       *time.Time  `json:"started_at,omitempty"`
@@ -307,8 +317,10 @@ An empty label never changes the classification.
 
 ### 3.2 Detector (`detect/makemkv`)
 
-1. Call `Output(ctxWithTimeout(30s), {Name:"makemkvcon", Args:["-r","--cache=1","info","disc:9999"], Tool:"makemkvcon"})`.
-   If it times out or exits with an error, return `(Disc{State: StateUnknown}, err)`.
+1. `out, err := scanner.Scan(ctx)`. The `Scanner` runs
+   `Output(ctxWithTimeout(30s), {Name:"makemkvcon", Args:["-r","--cache=1","info","disc:9999"], Tool:"makemkvcon"})`
+   under a mutex and caches the result (output and error) for 5 s, so N drives polling on the same
+   tick cause one MakeMKV scan. If `err != nil`, return `(Disc{State: StateUnknown, Device: device}, err)`.
 2. Call `ParseDRV(out, device)`. If it returns an error, return `StateUnknown` and the error.
 3. If `Kind == KindCD` **or** `State == StateEmpty`, run
    `Output(ctx, {Name:"cdparanoia", Args:["-d",device,"-Q"], Tool:"cdparanoia"})` and ignore its exit code.
@@ -319,8 +331,7 @@ An empty label never changes the classification.
 
 ### 3.3 Engine loop (`engine.Run`)
 
-**At start**
-- `Output.CleanStaging()`: remove `<kind>/.staging` for every kind dir (leftovers from a crash).
+**At start** (staging was already cleaned once by `serve`, before any engine started; C§3.8)
 - Create a ticker: `time.NewTicker(cfg.PollInterval)`.
 - Run one pass immediately, then one pass per tick, until `ctx.Done()`; then return `nil`.
 
@@ -329,7 +340,7 @@ An empty label never changes the classification.
 1. Set state to detecting. Call `Detect(ctx)`.
 2. **Detect error, or `StateUnknown`:**
    - `bad++`; log WARN with `err` and `raw`.
-   - When `bad` first reaches `BadThreshold`: `notifyDetached(Failure, "Drive not responding", err)`.
+   - When `bad` first reaches `BadThreshold`: `notifyDetached(Failure, "Drive not responding (<drive>)", err)`.
    - While `bad >= BadThreshold`, `Ready` returns an error.
    - Keep `awaitingRemoval` unchanged, set state to idle (or awaiting_removal), end the pass.
    - Never eject here, and never exit.
@@ -340,7 +351,7 @@ An empty label never changes the classification.
 5. **State Empty, Open or Loading** → log DEBUG, set state idle, end the pass.
 6. **State Inserted:** set state ripping, `StartedAt = Now()`, then run the rip plan (§3.4) step by step.
    For each step:
-   - `dir, err := Output.Prepare(kindDir, d.Label, Now())`.
+   - `dir, err := Output.Prepare(kindDir, cfg.Drive, d.Label, Now())`.
    - `err = ripper.Rip(ctx, d, dir)`.
    - If `ctx.Err() != nil` (shutdown):
      - `Output.Cleanup(dir)` using `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`;
@@ -358,6 +369,9 @@ An empty label never changes the classification.
      a disc being re-ripped every tick when the eject fails, when ejecting is off, or after a failure.
 8. Notify `Success` if every step succeeded; `Failure` if any step failed. A plan that is only
    skipped steps sends no notification.
+
+Every engine instruments itself per §6.2 (metrics) and §6.4 (spans), and adds `drive` to every log record
+(`logger.With("drive", cfg.Drive)`).
 
 `notifyDetached(e)` calls `Notify(ctx', e)`, where `ctx'` is
 `context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)`. Its errors are logged at WARN
@@ -385,7 +399,7 @@ type Settings struct {
 
 func NewPlanner(s Settings) (*Planner, error)                   // os.OpenRoot(OutputDir); creates the 4 kind dirs
 func (p *Planner) CleanStaging() error
-func (p *Planner) Prepare(kindDir, label string, now time.Time) (dir string, err error)
+func (p *Planner) Prepare(kindDir, drive, label string, now time.Time) (dir string, err error)
 func (p *Planner) Finalize(kindDir, dir string) (path string, err error)
 func (p *Planner) Cleanup(ctx context.Context, dir string) error
 func (p *Planner) Close() error
@@ -403,19 +417,21 @@ const (
   No label can escape it.
 - **Sanitise:** replace every rune not in `[A-Za-z0-9 ._-]` with `_`; trim leading/trailing spaces
   and dots; truncate to 100 bytes. If the result is empty, use `disc_<YYYYMMDD_HHMMSS>`.
-- **Prepare:** returns the absolute path of `<kindDir>/.staging/<YYYYMMDD_HHMMSS>/<name>`, created
+- **Concurrency:** several engines share one Planner. `os.Root` is safe for concurrent use; `Finalize`
+  holds a `sync.Mutex` for its check-then-rename so two drives can't claim the same target.
+- **Prepare:** returns the absolute path of `<kindDir>/.staging/<YYYYMMDD_HHMMSS>-<drive>/<name>`, created
   with mode 0o777 (the umask applies). `<name>` is the sanitised label, so the ISO backend can name
   its files `<name>.iso` / `<name>.map`.
 - **Finalize:**
-  - **BluRay/DVD/DATA:** the target is `<kindDir>/<name>`. If that exists, use `<name>_<YYYYMMDD_HHMMSS>`.
+  - **BluRay/DVD/DATA:** the target is `<kindDir>/<name>`. If that exists, use `<name>_<YYYYMMDD_HHMMSS>_<drive>`.
     If that also exists, fail with an error. Then one `Root.Rename(staging, target)`, then remove
-    `<kindDir>/.staging/<ts>`.
+    `<kindDir>/.staging/<ts>-<drive>`.
   - **CD:** move each child of the staging dir except `.wav` to `CD/<child>`, using the same
-    collision rule. Then remove `CD/.staging/<ts>`. The returned path is the first moved child.
+    collision rule. Then remove `CD/.staging/<ts>-<drive>`. The returned path is the first moved child.
   - Then apply ownership and permissions recursively to each finalized path (§5.4).
   - Staging lives inside its kind dir, so a rename never crosses a mount (no `EXDEV` when kind dirs
     are separate bind mounts).
-- **Cleanup:** `Root.RemoveAll(<kindDir>/.staging/<ts>)`.
+- **Cleanup:** `Root.RemoveAll(<kindDir>/.staging/<ts>-<drive>)`.
 
 ### 3.6 Commands (exact argv)
 
@@ -441,9 +457,9 @@ const (
 
 | Kind | Title | Body |
 |---|---|---|
-| Success | `Ripped <label>` | `<kind> → <paths joined by ", ">` |
-| Failure | `Rip failed: <label>` / `Drive not responding` | the error string |
-| Stopped | `Ripper stopped` | the reason |
+| Success | `Ripped <label> (<drive>)` | `<kind> → <paths joined by ", ">` |
+| Failure | `Rip failed: <label> (<drive>)` / `Drive not responding (<drive>)` | the error string |
+| Stopped | `Ripper stopped (<drive>)` | the reason |
 
 - `notify/apprise` maps Success → `apprise.NotifySuccess`, Failure → `NotifyFailure`,
   Stopped → `NotifyWarning`.
@@ -460,7 +476,9 @@ const (
 4. Get the key: `cfg.MakeMKVKey`, or if that's empty, `makemkvkey.FetchBetaKey(ctx, client, makemkvkey.ForumURL)`
    (client per §5.5). `os.MkdirAll(<home>/.MakeMKV, 0o700)`. Then `makemkvkey.Register`.
    Any error here: log WARN and continue.
-5. `patchbay.Backends` → `patchbay.Spec` → `lifecycle.Run`.
+5. `output.NewPlanner` → `CleanStaging()` (once, before any engine starts).
+6. `patchbay.Backends` builds one `engine.Deps` per drive (sharing one Scanner, Planner, Notifier,
+   Logger, Tracer and Metrics) → one `*engine.Engine` per drive → `patchbay.Spec` → `lifecycle.Run`.
 
 Never log the key, the apprise URLs, or the web password. `execrunner` never logs argv (§5.1),
 so `makemkvcon reg <key>` is safe to run through it.
@@ -478,7 +496,7 @@ so `makemkvcon reg <key>` is safe to run through it.
 
 | Pattern | When | Handler | Success | Errors |
 |---|---|---|---|---|
-| `GET P/api/v1/status` | always | huma; OperationID `getStatus`, Tag `status` | 200 `engine.Status` | — |
+| `GET P/api/v1/status` | always | huma; OperationID `getStatus`, Tag `status` | 200 `StatusResponse` | — |
 | `GET P/api/v1/log` | always | huma; OperationID `getLog`, Tag `log`; query `lines` int, default 200, min 1, max 2000 | 200 `LogResponse` | 422 |
 | `GET P/openapi.json` | always | raw; `api.Huma.OpenAPI().MarshalJSON()` | 200 `application/json` | — |
 | `GET P/openapi.yaml` | always | raw; `api.Huma.OpenAPI().YAML()` | 200 `application/yaml` | — |
@@ -491,6 +509,10 @@ so `makemkvcon reg <key>` is safe to run through it.
 | `GET /{$}` | P ≠ "" or headless | raw; 302 → `P/` (UI) or `P/docs` (headless) | — | — |
 
 ```go
+type StatusResponse struct {
+	Drives []engine.Status `json:"drives"` // in RIPPER_DRIVES order
+}
+
 type LogResponse struct {
 	Lines []string `json:"lines"` // raw JSON log records, newest first
 }
@@ -506,8 +528,11 @@ type LogResponse struct {
 
 ```go
 ready := httpapi.NewReadiness()
-ready.Register("drive", func(ctx context.Context) error { _, err := os.Stat(cfg.Drive); return err })
-ready.Register("detector", eng.Ready)
+for i, dev := range cfg.Drives {
+	id := filepath.Base(dev)
+	ready.Register("drive:"+id, func(ctx context.Context) error { _, err := os.Stat(dev); return err })
+	ready.Register("detector:"+id, engines[i].Ready)
+}
 ```
 
 Build the admin server with `httpapi.NewAdmin(AdminOptions{Addr, Readiness: ready, Registry: p.PromRegistry, Logger})`.
@@ -570,7 +595,9 @@ if ctx.Err() != nil && cmd.Process != nil {
 ```
 
 - Log a DEBUG `"exec"` record with `tool` before running. Argv is **not** logged at any level.
-- Each output line → `logger.Info("tool output", "tool", c.Tool, "line", line)`.
+- Each output line → `logger.InfoContext(ctx, "tool output", "tool", c.Tool, "line", line)`.
+- Each Run/Output is wrapped in a `tool.run` span (§6.4) and records `ripper.tool.runs` / `ripper.tool.duration` (§6.2).
+- Constructor: `execrunner.New(logger *slog.Logger, tracer trace.Tracer, meter metric.Meter) (*Runner, error)`.
 - Errors:
   - `ctx.Err() != nil` → `fmt.Errorf("%s: %w", c.Tool, ctx.Err())`;
   - `*exec.ExitError` (`errors.AsType`) → `&runner.ExitError{Tool, Code: ee.ExitCode()}`;
@@ -596,7 +623,9 @@ func (n *Notifier) Notify(ctx context.Context, e notify.Event) error {
 ```
 
 - Build the client once: `a := apprise.New(); err := a.AddAll(urls...)`.
-- Never call `Send` concurrently; apprise-go keeps package-level HTTP state.
+- Engines for several drives can notify at the same time, but apprise-go keeps package-level HTTP
+  state and must not be called concurrently. The `Notifier` holds a `sync.Mutex` around `Send`
+  (inside the goroutine), so calls are serialised.
 
 ### 5.3 Exit codes (`cli.Execute(ctx) int`)
 
@@ -633,8 +662,9 @@ c, err := outbound.New(outbound.Config{Product: "ripper", Version: version(),
 
 ### 5.6 `ripper detect`
 
-- Builds `execrunner` + `detect/makemkv`, calls `Detect`, and prints the `disc.Disc` as indented JSON to stdout.
-- Exit 0 for any State, including Empty. Exit 1 on a detect error (the error goes to stderr).
+- Builds `execrunner`, one `Scanner` and a `Detector` per drive in `RIPPER_DRIVES`, calls `Detect` on
+  each, and prints a JSON array of `disc.Disc` (in `RIPPER_DRIVES` order) to stdout, indented.
+- Exit 0 for any State, including Empty. Exit 1 if any drive returns a detect error (errors go to stderr).
 - `--raw` also prints the raw `makemkvcon` output, then the raw `cdparanoia -Q` output, each under a
   `--- <tool> ---` header. This is how hardware fixtures are captured.
 
@@ -643,3 +673,155 @@ c, err := outbound.New(outbound.Config{Product: "ripper", Version: version(),
 `version()` lives in `internal/cli/version.go`. It returns `debug.ReadBuildInfo().Main.Version`
 (stamped from the git tag) plus the short `vcs.revision` when present. Do not use `-ldflags -X`.
 Docker builds must include `.git` in the build context.
+
+---
+
+## 6. Observability
+
+**Slot 0 is the default and needs no configuration:** Prometheus pull metrics and JSON logs on
+stdout. OTLP export (§6.5) is added on top only when the standard `OTEL_*` variables ask for it.
+
+### 6.1 Health checks (admin listener, provided by go-service-kit)
+
+| Endpoint | Meaning | Response | k8s probe | Docker |
+|---|---|---|---|---|
+| `GET /healthz` | **Liveness**: the process is running and not wedged. It never checks dependencies, so a drive problem never restarts the container. | `200`, `text/plain`, body `ok\n`. Always, including while draining. | `livenessProbe` | `HEALTHCHECK` via `ripper healthcheck` |
+| `GET /readyz` | **Readiness**: should traffic be routed here? | `200` when every check passes, otherwise `503`. JSON schema below. | `readinessProbe` | — |
+
+No startup probe: the listeners start within seconds of process start.
+
+`/readyz` body (the kit's `httpapi.ReadinessReport`; checks are sorted by name; each runs with a 2 s timeout):
+
+```json
+{
+  "status": "ok | failed | shutting_down",
+  "checks": [
+    { "name": "detector:sr0", "status": "ok" },
+    { "name": "drive:sr0", "status": "failed", "error": "stat /dev/sr0: no such file or directory" }
+  ]
+}
+```
+
+- Checks per drive: `drive:<id>` (the device node exists) and `detector:<id>` (fewer than 5 bad
+  replies in a row).
+- During shutdown `status` is `shutting_down`, the code is 503, and the checks are not run.
+
+This follows the Kubernetes liveness/readiness convention. (The IETF "health+json" draft expired
+and is not a standard.)
+
+### 6.2 Metrics (Slot 0: Prometheus pull at `GET <ADMIN_ADDR>/metrics`)
+
+**Provided by the kit:**
+- Go runtime metrics;
+- `service_build_info`;
+- HTTP request/error/duration metrics for the API listener (otelhttp);
+- `lifecycle_worker_restarts_total`.
+
+**Ripper's own instruments.** Create them once in `internal/engine/metrics.go` with
+`func NewMetrics(m metric.Meter) (*Metrics, error)`, using `p.Meter` from `obs.Setup`. The kit's
+exporter rewrites the instrument name into the exported name below. Use the instrument names and
+units exactly; do not add labels.
+
+| Instrument (name, type, unit) | Exported name | Labels | Recorded by | When |
+|---|---|---|---|---|
+| `ripper.rips`, Int64Counter, `{rip}` | `ripper_rips_total` | `drive`, `kind`, `outcome` | engine | after each rip plan (outcome: success/failure/cancelled/skipped) |
+| `ripper.rip.duration`, Float64Histogram, `s` | `ripper_rip_duration_seconds` | `drive`, `kind`, `outcome` | engine | same; buckets `60,300,600,1200,1800,3600,5400,7200,10800` (`metric.WithExplicitBucketBoundaries`) |
+| `ripper.detect.results`, Int64Counter, `{result}` | `ripper_detect_results_total` | `drive`, `state` (disc.State or `error`) | engine | each pass |
+| `ripper.drive.bad_responses`, Int64Gauge, `{response}` | `ripper_drive_bad_responses` | `drive` | engine | each pass |
+| `ripper.engine.state`, Int64Gauge, `{state}` | `ripper_engine_state` | `drive`, `state` | engine | on every transition: 1 for the new state, 0 for the old one |
+| `ripper.tool.runs`, Int64Counter, `{run}` | `ripper_tool_runs_total` | `tool`, `result` (`ok`, `exit_error`, `cancelled`, `error`) | execrunner | after each Run/Output |
+| `ripper.tool.duration`, Float64Histogram, `s` | `ripper_tool_duration_seconds` | `tool` | execrunner | same; default buckets |
+| `ripper.notifications`, Int64Counter, `{notification}` | `ripper_notifications_total` | `kind`, `result` (`ok`, `error`) | engine (`notifyDetached`) | after each Notify |
+
+- Every label value comes from a fixed set: drive IDs from config, the enums in C§2, and tool
+  names. Labels, disc labels, paths and errors are **never** metric labels.
+
+### 6.3 Logs (Slot 0: JSON on stdout)
+
+One JSON object per line, written by `obs.NewLogger` (the slog JSON handler with redaction) and
+teed into the log ring (C§2.3) for `GET /api/v1/log`.
+
+| Field | Type | Present | Source |
+|---|---|---|---|
+| `time` | RFC 3339 with nanoseconds | always | slog |
+| `level` | `DEBUG` \| `INFO` \| `WARN` \| `ERROR` | always | slog |
+| `msg` | string, **static** (from the catalogue below) | always | caller |
+| `service` | `"ripper"` | always | kit |
+| `version` | build version | always | kit |
+| `trace_id`, `span_id` | hex | inside a span | kit |
+| `drive` | drive ID | every engine record | engine logger |
+| `state` | engine state | state changes | engine |
+| `disc_kind`, `disc_label` | string | rip records | engine |
+| `outcome` | success/failure/cancelled/skipped | `rip finished` | engine |
+| `path` | string (relative to OUTPUT_DIR) | `rip finished` | engine |
+| `tool` | string | runner records | execrunner |
+| `line` | string | `tool output` | execrunner |
+| `exit_code` | int | `tool failed` | execrunner |
+| `duration_ms` | int | `rip finished`, `tool finished` | engine, execrunner |
+| `error` | string | any failure | caller (`slog.Any("error", err)`) |
+
+Rules:
+- `msg` is a constant (sloglint `static-msg`); keys are snake_case (sloglint `key-naming-case`).
+- Always log through the context-aware calls (`InfoContext(ctx, …)`) so `trace_id` is attached.
+- Never log argv, the MakeMKV key, apprise URLs or the web password. The kit also redacts by key
+  name as a backstop.
+
+**Message catalogue** (the only `msg` values; add new ones here first):
+
+| msg | level | key fields |
+|---|---|---|
+| `ripper starting` | INFO | version, drives (count) |
+| `config invalid` | ERROR | error |
+| `makemkv key registration failed` | WARN | error |
+| `staging cleaned` | INFO | — |
+| `disc detected` | INFO | drive, disc_kind, disc_label |
+| `detect failed` | WARN | drive, error |
+| `drive not responding` | ERROR | drive |
+| `rip started` | INFO | drive, disc_kind, disc_label |
+| `rip finished` | INFO | drive, disc_kind, disc_label, outcome, path, duration_ms |
+| `rip failed` | ERROR | drive, disc_kind, disc_label, error |
+| `rip cancelled` | WARN | drive, disc_label |
+| `rip step skipped` | WARN | drive, disc_kind, reason |
+| `safe to eject` | INFO | drive |
+| `eject failed` | ERROR | drive, error |
+| `disc removed` | INFO | drive |
+| `waiting for disc removal` | DEBUG | drive |
+| `exec` | DEBUG | tool |
+| `tool output` | INFO | tool, line |
+| `tool finished` | DEBUG | tool, duration_ms |
+| `tool failed` | WARN | tool, exit_code, error |
+| `notification failed` | WARN | kind, error |
+| `cleanup failed` | ERROR | drive, error |
+
+### 6.4 Traces
+
+Use `p.Tracer` from `obs.Setup`. HTTP server spans come from the kit. Ripper adds:
+
+| Span | Parent | Attributes | Status |
+|---|---|---|---|
+| `engine.rip` | none (root; one per rip plan) | `ripper.drive`, `ripper.disc.kind`, `ripper.outcome` | `Error` on failure |
+| `rip.step` | `engine.rip` | `ripper.ripper` (`video`/`audio`/`iso`), `ripper.kind_dir` | `Error` on failure |
+| `tool.run` | the current span (from ctx) | `ripper.tool`, `process.exit.code` | `Error` on non-zero exit |
+
+Detection passes are **not** traced (a span per minute per drive would be noise).
+
+### 6.5 OTLP export (when the `OTEL_*` variables ask for it)
+
+This is implemented **in go-service-kit `obs`**, not in ripper. Ripper pins the kit release that has
+it (P2.0). Behaviour of the kit change:
+
+| Signal | Slot 0 (always) | OTLP added when | Exporter |
+|---|---|---|---|
+| Traces | none (spans dropped) | `OTEL_EXPORTER_OTLP_ENDPOINT` or `…_TRACES_ENDPOINT` is set, and `OTEL_TRACES_EXPORTER` ≠ `none` (unchanged kit behaviour) | otlptrace (gRPC/HTTP per `OTEL_EXPORTER_OTLP_PROTOCOL`) |
+| Metrics | Prometheus reader → admin `/metrics` | `OTEL_METRICS_EXPORTER` contains `otlp`, **or** it is unset and an OTLP endpoint variable is set | `PeriodicReader(otlpmetric…)`, added *alongside* the Prometheus reader; interval from `OTEL_METRIC_EXPORT_INTERVAL` |
+| Logs | JSON handler → stdout (+ ring) | `OTEL_LOGS_EXPORTER` contains `otlp`, **or** it is unset and an OTLP endpoint variable is set | `sdk/log` `LoggerProvider` + `BatchProcessor(otlplog…)`. slog fans out with `slog.NewMultiHandler(jsonHandler, redact(otelslog.NewHandler(...)))`; redaction applies to both branches |
+
+- `none` in any `OTEL_*_EXPORTER` variable disables that signal's OTLP export. Slot 0 never turns off.
+- All configuration (endpoint, headers, protocol, timeout, resource attributes, `OTEL_SERVICE_NAME`)
+  comes from the standard OTel variables; the kit adds no config of its own.
+- `Providers.Shutdown` flushes all three providers within the kit's flush budget.
+- Kit modules to add: `go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc` (+http),
+  `go.opentelemetry.io/otel/sdk/log`, `go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc` (+http),
+  `go.opentelemetry.io/contrib/bridges/otelslog`.
+- `autoexport` is **not** used: its Prometheus mode starts its own HTTP server, which would
+  conflict with the kit's admin `/metrics`.

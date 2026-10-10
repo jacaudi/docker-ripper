@@ -65,9 +65,9 @@ Tool name = `filepath.Base(os.Args[0])`. Everything is driven by `$FAKEBIN_DIR`:
 |---|---|
 | `calls.jsonl` | fakebin appends `{"tool":"<name>","args":[...]}` + `\n` (`O_APPEND`) |
 | `<tool>.count` | per-tool call counter, maintained by fakebin (1-based) |
-| `<tool>.<n>.stdout` / `<tool>.stdout` | stdout for call n, else the default. Missing = no output |
-| `<tool>.<n>.stderr` / `<tool>.stderr` | same, for stderr |
-| `<tool>.<n>.exit` / `<tool>.exit` | exit code as a decimal (default `0`) |
+| `<tool>.<n>.stdout` / `<tool>.<dev>.stdout` / `<tool>.stdout` | stdout for call n, else for the device (`<dev>` = basename of the first arg starting with `/dev/`, e.g. `cdparanoia.sr1.stdout`), else the default. Missing = no output |
+| `<tool>.<n>.stderr` / `<tool>.<dev>.stderr` / `<tool>.stderr` | same lookup order, for stderr |
+| `<tool>.<n>.exit` / `<tool>.<dev>.exit` / `<tool>.exit` | exit code as a decimal (default `0`), same lookup order |
 | `<tool>.creates` | one path template per line, each created as a file containing `fake` (parents created). Templates: `{arg:N}` (0-based arg), `{lastarg}`, `{abcde_outputdir}` (the `OUTPUTDIR=` value read from the file after `-c`). Applied only for a `makemkvcon` call whose args contain `mkv`, and always for `ddrescue` and `abcde` |
 | `<tool>.block` | if present: after recording the call, block until `<tool>.release` exists (poll 50 ms) or SIGTERM arrives. On SIGTERM exit 143 **without** applying `creates` |
 
@@ -84,7 +84,14 @@ Typical setups:
   - apprise target `json://127.0.0.1:<port>` pointing at an `httptest` server;
   - listeners on `127.0.0.1:0`; fakebin on `PATH`.
 - Run `lifecycle.Run` in a goroutine.
-- Poll `GET /api/v1/status` until `last_result` appears (timeout 20 s), then cancel and wait for `Run` to return.
+- Poll `GET /api/v1/status` until every drive has a `last_result` (timeout 20 s), then cancel and wait for `Run` to return.
+- **Observability assertions in every scenario:**
+  - `GET <admin>/metrics` contains `ripper_rips_total` with the scenario's `kind` and `outcome`;
+  - every record in the log ring parses as JSON with `time`, `level`, `msg`, `service`, and its `msg`
+    is in the C§6.3 catalogue;
+  - no record contains the test key `T-test…` or an apprise URL;
+  - with an in-memory span exporter (`obs.Config.SpanExporter`), one `engine.rip` span exists per
+    rip, with `tool.run` children.
 
 | Scenario | Setup | Assert |
 |---|---|---|
@@ -94,4 +101,5 @@ Typical setups:
 | `iso_only_dvd` | dvd, `RIPPER_ISO_MODE=only` | ddrescue only; no `mkv` call |
 | `cancel_mid_rip` | bluray + `makemkvcon.block` | cancel while blocked; `Run` returns nil; no `BluRay/MOVIE`, no `.staging/<ts>`; no eject call; Stopped notification |
 | `eject_disabled` | dvd ×3 then empty, `RIPPER_EJECT=false` | exactly one `mkv` call (no re-rip); no eject call; status `awaiting_removal` until empty |
-| `bad_drive` | garbage ×6 | `/readyz` returns 503 after the 5th; one Failure notification; process still running |
+| `bad_drive` | garbage ×6 | `/readyz` returns 503 with `detector:sr0` failed after the 5th; one Failure notification; process still running |
+| `two_drives` | `RIPPER_DRIVES=/dev/sr0,/dev/sr1`; one makemkvcon fixture listing sr0 = bluray and sr1 = cd; `cdparanoia.sr1.stdout` = audio; `makemkvcon.block` released after abcde has started | **both rips run concurrently** (abcde starts before the BluRay rip finishes); `BluRay/MOVIE/…` and `CD/Artist-Album/…` exist; two Success notifications; status lists both drives |

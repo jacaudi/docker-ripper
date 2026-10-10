@@ -22,7 +22,8 @@ If something you need is not specified, **stop and ask**. Do not invent behaviou
 
 Replace the bash ripper, the init script and the Python web UI with one Go binary, `ripper`.
 It runs either as a **headless API service** (`ripper serve --headless`) or as **API + web UI**
-(`ripper serve`), and rips discs reliably without anyone watching.
+(`ripper serve`), and rips discs reliably without anyone watching, on **one or more drives at once**
+(e.g. a BluRay on `sr0` and an audio CD on `sr1` concurrently).
 
 The conversion is **not 1-to-1**. What carries over unchanged:
 - the tool command lines;
@@ -33,7 +34,7 @@ The conversion is **not 1-to-1**. What carries over unchanged:
 Configuration, logging, the API, the UI and the error handling are redesigned. This fork
 **diverges from upstream permanently**.
 
-Out of scope: multi-drive support, new output formats, re-implementing abcde's audio pipeline.
+Out of scope: new output formats, re-implementing abcde's audio pipeline.
 
 ## 2. Decisions log
 
@@ -66,6 +67,8 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
 | 25 | Re-rip protection | After any rip attempt the engine waits for the disc to be removed. It never re-rips the same disc. |
 | 26 | Staging | Every rip goes into `<kind>/.staging/…` and is renamed into place on success; staging is cleaned at start. |
 | 27 | Native ioctl backends | Future note only (phases.md "Future"). |
+| 28 | Multiple drives | In scope: `RIPPER_DRIVES` list; one engine (lifecycle worker) per drive, rips run concurrently. One shared MakeMKV scan per tick, one output planner, one serialised notifier. Per-drive status, readiness checks and metric labels. |
+| 29 | Observability | Slot 0 = Prometheus pull (`:9091/metrics`) + JSON logs on stdout; liveness `/healthz` and readiness `/readyz` with documented schemas; a defined metric set, log schema + message catalogue, and spans (C§6). OTLP export of traces, metrics **and logs** when `OTEL_*` is set, implemented in go-service-kit `obs` (P2.0). |
 
 ## 3. Glossary
 
@@ -78,8 +81,10 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
   `lifecycle.Worker`.
 - **Pass**: one iteration of the engine loop (C§3.3).
 - **Rip plan**: the ordered rip steps for an (ISO mode, kind) pair (C§3.4).
+- **Drive ID**: the device basename, e.g. `sr0` (C§1.2).
 - **Kind dir**: `BluRay`, `DVD`, `CD` or `DATA` under `RIPPER_OUTPUT_DIR`.
-- **Staging dir**: `<kind dir>/.staging/<ts>/<name>`, where a rip writes before it is finalized (C§3.5).
+- **Staging dir**: `<kind dir>/.staging/<ts>-<drive>/<name>`, where a rip writes before it is finalized (C§3.5).
+- **Slot 0**: the observability defaults that need no config: Prometheus pull metrics and JSON logs on stdout.
 - **Awaiting removal**: the engine state after a rip attempt, until the drive reports empty or open.
 - **fakebin**: the fake external-tools binary used in tests (T§3).
 - **C§n / T§n / L§n**: section n of `contracts.md` / `testing.md` / `tooling.md`.
@@ -91,7 +96,7 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
   - `os.Root` for every output-dir file operation;
   - `errors.AsType`, `strings.Lines`, `sync.WaitGroup.Go`, `http.CrossOriginProtection`;
   - `testing/synctest` with `synctest.Sleep`;
-  - `t.Context()`;
+  - `t.Context()`, and `slog` `…Context` calls so logs carry `trace_id`;
   - `context.WithoutCancel` for cleanup;
   - `debug.ReadBuildInfo` for the version.
 - Run `task lint test vuln` before every commit (`task check` once `web/` exists).
@@ -105,7 +110,8 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
 - Do not keep package-level mutable state.
 - Do not use `http.StripPrefix`, or anything else that clones the request, as listener middleware.
 - Do not use `cmd.StdoutPipe` with `cmd.Run`/`Wait`.
-- Do not log argv, the MakeMKV key, apprise URLs or the web password.
+- Do not log argv, the MakeMKV key, apprise URLs or the web password. Do not use a `msg` that isn't in the C§6.3 catalogue.
+- Do not use disc labels, paths or errors as metric labels.
 - Do not use `-ldflags -X` for the version. Do not use `encoding/json/v2`.
 - Do not use `synctest` around real processes or listeners.
 - Do not execute user-supplied scripts. Do not call `useradd`/`groupadd`.
@@ -126,7 +132,7 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
 ## 6. Deployment and runtime
 
 - **One instance, pinned to the host that owns the drive.**
-  - Docker: `--device /dev/srN --device /dev/sgN`.
+  - Docker: `--device /dev/srN --device /dev/sgN` for **each** drive.
   - Kubernetes: a device-plugin DaemonSet ([generic-device-plugin](https://github.com/squat/generic-device-plugin/issues/62),
     [Talos guide](https://docs.siderolabs.com/kubernetes-guides/advanced-guides/device-plugins.md)),
     `replicas: 1`, `strategy: Recreate`, and a node selector.
@@ -139,10 +145,13 @@ Out of scope: multi-drive support, new output formats, re-implementing abcde's a
   
   Total grace = 5 + 5 + 15 + 5 margin = **30 s**. Use compose `stop_grace_period: 30s` and
   k8s `terminationGracePeriodSeconds: 30`.
-- **Health**: Docker `HEALTHCHECK CMD ["ripper","healthcheck"]` checks admin `/healthz`.
+- **Health** (schemas in C§6.1): Docker `HEALTHCHECK CMD ["ripper","healthcheck"]` checks admin `/healthz`.
   - k8s liveness probe: `/healthz`.
-  - k8s readiness probe: `/readyz`, with checks `drive` (device present) and `detector` (fewer than
-    5 bad replies in a row).
+  - k8s readiness probe: `/readyz`, with checks `drive:<id>` (device present) and `detector:<id>`
+    (fewer than 5 bad replies in a row), per drive.
+- **Metrics**: Prometheus scrapes `:9091/metrics` (ServiceMonitor targets the admin port).
+- **OTLP**: set `OTEL_EXPORTER_OTLP_ENDPOINT` (+ the standard `OTEL_*` variables) to also push traces,
+  metrics and logs to a collector (C§6.5).
 - Go ≥ 1.25 sets `GOMAXPROCS` from the container's CPU limit automatically.
 
 ## 7. Dependencies
@@ -179,7 +188,7 @@ Two trade-offs are accepted:
 
 | Old | New |
 |---|---|
-| `DRIVE` | `RIPPER_DRIVE` |
+| `DRIVE` | `RIPPER_DRIVES` (comma-separated list; several drives rip concurrently) |
 | `STORAGE_CD/DATA/DVD/BD` | `RIPPER_OUTPUT_DIR` (fixed `CD/ DATA/ DVD/ BluRay/` subdirs; `/out/Ripper` keeps the old layout) |
 | `EJECTENABLED` | `RIPPER_EJECT` |
 | `JUSTMAKEISO` / `ALSOMAKEISO` | `RIPPER_ISO_MODE=only` / `also` |
@@ -217,11 +226,13 @@ Two trade-offs are accepted:
 9. `ISO_MODE` skips audio CDs, which can't be imaged.
 10. `default.mmcp.xml` is now actually used: from `/config` if present, otherwise the built-in one.
 11. The MakeMKV key is never logged; `~/.MakeMKV` has mode 0700.
-12. JSON logs on stdout. The UI shows the last 2000 records since the process started.
+12. JSON logs on stdout with a fixed schema. The UI shows the last 2000 records since the process started.
+    Prometheus metrics on `:9091/metrics`; optional OTLP export via the standard `OTEL_*` variables.
 13. The API is `/api/v1/status` and `/api/v1/log`, with OpenAPI at `/openapi.json` and docs at `/docs`.
     Admin endpoints are on port 9091.
 14. The web UI is rewritten in React + Ant Design. Basic auth is constant-time, with CSRF protection.
 15. The image is `ubuntu:noble` + tools + tini + `ripper`, published to `ghcr.io/jacaudi/docker-ripper`.
+16. Several drives can rip at the same time (`RIPPER_DRIVES`).
 
 ## 9. Repository admin (manual)
 
@@ -236,6 +247,8 @@ Two trade-offs are accepted:
 ## 10. Remaining risks
 
 - **apprise-go** is pre-1.0. It sits behind the `Notifier` seam; re-evaluate in phase 2.
+- **OTLP logs/metrics** depend on the go-service-kit change (P2.0); until it ships, only traces go over OTLP.
+- **Concurrent MakeMKV instances** (multi-drive) are assumed to work; this is checked at P4.5 with two drives if available.
 - **`makemkvcon reg`** is assumed to write `app_Key` itself; this is checked at P4.5.
 - **DVD/BD data discs** are treated as video until a hardware capture shows a distinguishing signal.
 - **The beta key** is fetched once per start; the weekly rebuild and the restart policy cover rotation.

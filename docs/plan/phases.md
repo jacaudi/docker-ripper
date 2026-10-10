@@ -100,6 +100,7 @@ Pinned versions (Renovate keeps them current afterwards):
 - Test (use `t.Setenv`):
   - defaults;
   - each `RIPPER_*` maps to its field;
+  - `RIPPER_DRIVES=/dev/sr0,/dev/sr1` → two entries; duplicate basenames → error;
   - **empty env → default**;
   - `--headless` overrides `RIPPER_HEADLESS=false`;
   - comma list for `RIPPER_APPRISE_URLS`;
@@ -138,19 +139,27 @@ Pinned versions (Renovate keeps them current afterwards):
 
 ## Phase 2 — Engine and backends
 
+**P2.0 go-service-kit OTLP metrics + logs (owner, in `leftathome/go-service-kit`; does not block)**
+- Do: implement C§6.5 in the kit's `obs` package (with tests), and release it as `v0.4.0`.
+- Ripper keeps `v0.3.0` until that release exists; bumping it is a one-line `go get` in any later task.
+- Done when: the kit release exists and ripper's `go.mod` requires it.
+
 **P2.1 `internal/runner` + `execrunner`**
-- Do: C§2.2, C§5.1.
+- Do: C§2.2, C§5.1, plus its metrics (C§6.2) and `tool.run` span (C§6.4).
 - Test (fakebin):
   - stdout and stderr lines are logged with the `tool` attr;
   - argv never appears in any log record;
   - exit code → `ExitError` via `errors.AsType`;
   - cancelling during `.block` returns within 6 s, and `syscall.Kill(-pgid, 0)` returns `ESRCH` afterwards;
-  - `Output` is capped at 1 MiB.
+  - `Output` is capped at 1 MiB;
+  - `ripper_tool_runs_total` is recorded with the right `result` (use an in-memory metric reader);
+  - a `tool.run` span is created (use the in-memory span exporter).
 
 **P2.2 `detect/makemkv`**
-- Do: `ParseDRV` (C§3.1) and the `Detector` (C§3.2).
+- Do: `ParseDRV` (C§3.1), the shared `Scanner` and the `Detector` (C§3.2).
 - Test: the T§2 expectation table; detector cases with fakebin: timeout (`.block` with a 1 s
   constructor timeout), the cdparanoia `audio` and `no_audio` paths, and makemkvcon exit 1.
+  Scanner: two detectors on the same tick → exactly one `makemkvcon` call; a call after 5 s → a new scan.
 
 **P2.3 Rip backends**
 - Files: `rip/makemkv` (embed `default.mmcp.xml`, moved from `root/ripper/`), `rip/abcde`
@@ -177,7 +186,8 @@ Pinned versions (Renovate keeps them current afterwards):
   `Register` runs `makemkvcon reg <key>` via fakebin, and the key appears in no log record.
 
 **P2.7 `internal/engine`**
-- Do: C§2.4, C§3.3, C§3.4. Fakes per T§1.
+- Do: C§2.4, C§3.3, C§3.4, plus `metrics.go` (C§6.2), the spans (C§6.4) and the log messages (C§6.3).
+  Fakes per T§1.
 - Tests (all under synctest):
   - every cell of C§3.4;
   - repeated Empty/Open/Loading;
@@ -186,32 +196,36 @@ Pinned versions (Renovate keeps them current afterwards):
   - `Eject: false`, and a failed eject: both give no re-rip;
   - a rip failure: Cleanup called, Failure notification, eject, awaiting removal;
   - cancel mid-rip: Cleanup, Stopped notification via the detached ctx, no eject, `Run` returns nil;
-  - `Status()` transitions.
+  - `Status()` transitions;
+  - two engines (sr0, sr1) sharing a recording Notifier and a Planner run plans concurrently;
+  - metrics recorded per C§6.2 (in-memory reader); `engine.rip` / `rip.step` spans (in-memory exporter).
 
 **P2.8 Patchbay + `serve` (headless engine, admin only)**
 - Files: `internal/patchbay/backends.go`, `internal/patchbay/spec.go`, `internal/cli/serve.go`,
   `internal/cli/healthcheck.go`.
 - Do:
-  - `func Backends(cfg config.Config, run runner.Runner, logger *slog.Logger) (engine.Deps, error)`:
-    build every backend from C§2.3; `notify/nop` when `AppriseURLs` is empty.
-  - `func Spec(cfg config.Config, eng *engine.Engine, p *obs.Providers, ring *logring.Ring) (lifecycle.Spec, error)`
+  - `func Backends(cfg config.Config, run runner.Runner, p *obs.Providers, planner *output.Planner) ([]engine.Deps, error)`:
+    one `Deps` per drive in `cfg.Drives`. Shared across drives: one `Scanner`, the `Planner`, one Notifier
+    (`notify/nop` when `AppriseURLs` is empty), `p.Logger`, `p.Tracer`, and one `engine.NewMetrics(p.Meter)`.
+  - `func Spec(cfg config.Config, engines []*engine.Engine, p *obs.Providers, ring *logring.Ring) (lifecycle.Spec, error)`
     with:
     - the admin listener and readiness (C§4.2);
     - `PropagationDelay: lifecycle.NoPropagationDelay` (comment: single replica + Recreate);
     - `DrainTimeout: 5*time.Second`;
     - `Flush: p.Shutdown`, `Logger`, `MeterProvider`;
-    - the engine as `lifecycle.Worker{Name: "engine", Run: eng.Run, FinishCurrentCycle: true, StopTimeout: 15*time.Second}`.
+    - one worker per engine: `lifecycle.Worker{Name: "engine:" + id, Run: eng.Run, FinishCurrentCycle: true, StopTimeout: 15*time.Second}`.
       The kit cancels the context **immediately** in both modes; `FinishCurrentCycle` only means
       "wait up to 15 s for the cleanup to finish".
   - `serve` follows C§3.8.
   - `healthcheck`: GET `http://127.0.0.1:<port of RIPPER_ADMIN_ADDR>/healthz`, 2 s timeout, exit 1 on non-200.
-- Test: a patchbay test with ephemeral listeners: `/healthz` 200; `/readyz` 503 when the drive
-  path is missing.
+- Test: a patchbay test with ephemeral listeners: `/healthz` 200 `ok`; `/readyz` 200 with `drive:sr0` and
+  `detector:sr0` checks; 503 with `drive:sr0` failed when the device path is missing; `/metrics`
+  serves `ripper_` series.
 - Done when: `task lint test vuln` passes.
 
 **P2.9 `ripper detect`**
 - Do: C§5.6.
-- Test: JSON output for the bluray fixture via fakebin; exit 0 for empty; exit 1 on makemkvcon exit 1.
+- Test: a JSON array for one and two drives via fakebin; exit 0 for empty; exit 1 on makemkvcon exit 1.
 - **(owner):** run `ripper detect --raw` with a DVD, a BluRay, an audio CD, a data CD, an empty
   drive and an open tray. Paste the output into the T§2 fixtures and fix the expectation table if
   the hardware disagrees.
@@ -227,7 +241,7 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
   `type StatusSource interface{ Status() engine.Status }` and `type LogSource interface{ Lines(n int) []string }`),
   `auth.go` (C§4.3), tests, `testdata/openapi.json` (golden).
 - Test (`humatest`):
-  - status 200;
+  - status 200 with one entry per drive, in `RIPPER_DRIVES` order;
   - log 200 with N lines, newest first; `lines=0` → 422; `lines=2001` → 422;
   - auth: no creds → 401 with header; wrong → 401; right → 200; disabled when either is empty.
   - Golden: `OpenAPI().MarshalJSON()` with prefix `""` equals the golden file; `-update` rewrites it.
@@ -263,12 +277,14 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 - `main.tsx`: read the nonce from the meta tag; render `<App nonce={…}/>`.
 - `App.tsx`:
   - `ConfigProvider` with `csp={{ nonce }}` and `theme={{ algorithm: theme.darkAlgorithm }}`;
-  - `Layout` with a Header titled "Ripper", and Content holding `StatusCard` above `LogPanel`.
+  - `Layout` with a Header titled "Ripper", and Content holding a `Row` of `StatusCard`s (one per entry in
+    `drives`, `Col` span 24 on xs, 12 on lg) above `LogPanel`.
 - `api/client.ts`: `createClient<paths>({ baseUrl: '.' })` (openapi-fetch).
 - `hooks/usePoll.ts`: `usePoll(fn, ms)` runs at mount and then every `ms` via `setInterval`, skips
   ticks while `document.hidden`, and clears on unmount.
-- `components/StatusCard.tsx`:
-  - polls `GET /api/v1/status` every 5000 ms;
+- `hooks/useStatus.ts`: polls `GET /api/v1/status` every 5000 ms and returns `drives`.
+- `components/StatusCard.tsx` (props: one `Status`; no fetching of its own):
+  - title = drive ID and device;
   - AntD `Card` + `Descriptions`: state, disc kind, label, device, started at + live elapsed,
     bad responses, last result (outcome, error, paths);
   - state `Tag` colours: idle `default`, detecting `blue`, ripping `processing`, ejecting `cyan`,
@@ -277,12 +293,13 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 - `components/LogPanel.tsx`:
   - polls `GET /api/v1/log?lines=200` every 10000 ms;
   - AntD `Table` with `size="small"`, `pagination={false}`, `scroll={{ y: 600 }}`, columns
-    time / level / tool / message;
+    time / level / drive / tool / message;
   - each line is `JSON.parse`d into `{time, level, tool, msg, line}`; message = `line ?? msg`;
   - unparseable lines render as `{msg: raw}` in monospace.
 - No router, no login form (the browser handles basic auth), no clear button.
 - Test (vitest + jsdom + testing-library, `fetch` mocked with `vi.fn`): StatusCard renders a tag
-  for each state and the bad-drive alert; LogPanel renders a parsed row and a raw row.
+  for each state and the bad-drive alert; App renders two cards for two drives; LogPanel renders a
+  parsed row and a raw row.
 - Done when: `task ui:lint ui:test ui:build` passes and `internal/webui/dist/index.html` exists.
 
 **P3.5 `internal/webui`**
@@ -302,7 +319,7 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 - Test: hit every route in both modes.
 
 **P3.7 End-to-end smoke**
-- Do: T§4, every scenario.
+- Do: T§4, every scenario, including `two_drives` and the observability assertions.
 - Phase done when: `task check` passes.
 
 ---
@@ -387,6 +404,9 @@ CMD ["serve"]
 - Check that `makemkvcon reg` alone registers the key (`~/.MakeMKV/settings.conf` contains `app_Key`).
   If it doesn't, stop and ask.
 - Cancel one rip with `docker stop` and confirm the partial output is gone.
+- If two drives are available: rip a BluRay and an audio CD at the same time.
+- Scrape `:9091/metrics` and confirm the `ripper_` series. If you run an OTel collector, set
+  `OTEL_EXPORTER_OTLP_ENDPOINT` and confirm traces, metrics and logs arrive.
 
 Phase done when: CI is green and P4.5 is confirmed.
 
