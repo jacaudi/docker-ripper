@@ -33,17 +33,22 @@ The pre-conversion state is frozen on the `archive` branch. Do not commit to it.
   is "add a package + one case in the patchbay (or a config value)", never a
   refactor of the callers. Backends never construct other backends.
 
-## Target stack (decided — see `docs/golang-conversion-plan.md`)
+## Target stack (decided — see `docs/golang-conversion-plan.md` and `docs/plan/`)
 
-- Go 1.26; one binary `ripper`; entrypoint `cmd/ripper/main.go` → `internal/cli`.
-- **cobra** for commands (`serve`, `detect`, `healthcheck`, `version`); **viper** is the
-  only config loader (flags > env > defaults) and is imported only by `internal/cli`.
-- **go-service-kit** (`github.com/leftathome/go-service-kit`): `lifecycle` (signals,
-  workers, shutdown), `obs` (slog JSON + metrics + optional OTel), `httpapi` (huma
-  API listener + admin listener), `outbound` (all egress HTTP). Not `config`.
-- **apprise-go** (`github.com/unraid/apprise-go`) is the notification backend.
-- `ripper serve` = engine + API; web UI mounted unless `--headless`.
-- Images published to `ghcr.io/jacaudi/docker-ripper`. This fork diverges from upstream permanently.
+- **Go 1.27** (`go 1.27.0`, `toolchain go1.27.2`); one binary `ripper`; entrypoint
+  `cmd/ripper/main.go` → `internal/cli`.
+- **cobra** for commands (`serve [--headless]`, `detect`, `healthcheck`, `version`); **viper**
+  is the only config loader (flag > env > default) and only `internal/cli` imports it.
+- **go-service-kit** v0.3.0 (`github.com/leftathome/go-service-kit`): `lifecycle`, `obs`,
+  `httpapi` (huma; API `:9090`, admin `:9091`), `outbound`. Not its `config`.
+- **apprise-go** (`github.com/unraid/apprise-go`) for notifications (`APPRISE_URLS`).
+- **Web UI**: React 19 + Ant Design 6 (Vite, TypeScript 5.9) in `web/`, built into
+  `internal/webui/dist` and embedded; typed client generated from huma's OpenAPI.
+- **API docs**: Scalar, vendored + embedded, at `/docs`.
+- User scripts (`/config/ripper.sh`, per-disc hooks) are **removed**.
+- Images go to `ghcr.io/jacaudi/docker-ripper`; this fork diverges from upstream permanently.
+- The plan is executable task by task: `docs/plan/phases.md` (tasks), `docs/plan/contracts.md`
+  (normative types, config and behaviour), `docs/plan/testing.md`.
 
 ## Repository map
 
