@@ -35,20 +35,22 @@ The pre-conversion state is frozen on the `archive` branch. Do not commit to it.
 
 ## Target stack (decided — see `docs/golang-conversion-plan.md` and `docs/plan/`)
 
-- **Go 1.27** (`go 1.27.0`, `toolchain go1.27.2`); one binary `ripper`; entrypoint
-  `cmd/ripper/main.go` → `internal/cli`.
-- **cobra** for commands (`serve [--headless]`, `detect`, `healthcheck`, `version`); **viper**
-  is the only config loader (flag > env > default) and only `internal/cli` imports it.
-- **go-service-kit** v0.3.0 (`github.com/leftathome/go-service-kit`): `lifecycle`, `obs`,
-  `httpapi` (huma; API `:9090`, admin `:9091`), `outbound`. Not its `config`.
-- **apprise-go** (`github.com/unraid/apprise-go`) for notifications (`APPRISE_URLS`).
-- **Web UI**: React 19 + Ant Design 6 (Vite, TypeScript 5.9) in `web/`, built into
-  `internal/webui/dist` and embedded; typed client generated from huma's OpenAPI.
-- **API docs**: Scalar, vendored + embedded, at `/docs`.
-- User scripts (`/config/ripper.sh`, per-disc hooks) are **removed**.
-- Images go to `ghcr.io/jacaudi/docker-ripper`; this fork diverges from upstream permanently.
-- The plan is executable task by task: `docs/plan/phases.md` (tasks), `docs/plan/contracts.md`
-  (normative types, config and behaviour), `docs/plan/testing.md`.
+- **Go 1.27**; one binary `ripper`; entrypoint `cmd/ripper/main.go` → `internal/cli`.
+- **cobra** (`serve [--headless]`, `detect [--raw]`, `healthcheck`, `version`). **viper** is the only
+  config loader and lives only in `internal/cli`. Config is a clean `RIPPER_*` set of 19 keys; the
+  legacy variable names are not supported.
+- **go-service-kit** v0.3.0: `lifecycle`, `obs`, `httpapi` (API/UI/docs `:9090`, admin `:9091`), `outbound`.
+- **Seams** (5): runner, detect, rip, eject, notify. `internal/patchbay` selects the backends.
+- **apprise-go** for notifications, and as the hook for automation after a rip.
+- **Web UI**: React 19 + Ant Design 6, embedded. **API docs**: Scalar, embedded, at `/docs`.
+- Logs: JSON to stdout, plus an in-memory ring for the UI (no log file).
+- Every rip is staged (`<kind>/.staging/`) and renamed into place. After any rip the engine waits
+  for the disc to be removed.
+- User scripts (`/config/ripper.sh`, per-disc hooks) are removed. The conversion is **not 1-to-1**;
+  it is checked against a behaviour spec and Go tests, not against the legacy script.
+- Tooling: `taskfile.yml` (Task), golangci-lint v2, govulncheck, OSV-Scanner, CodeQL, Trivy,
+  Scorecard, release-please with Conventional Commits; images on `ghcr.io/jacaudi/docker-ripper`.
+- Executable plan: `docs/plan/phases.md` (tasks), `contracts.md` (normative), `testing.md`, `tooling.md`.
 
 ## Repository map
 
