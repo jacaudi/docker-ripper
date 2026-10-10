@@ -37,19 +37,22 @@ The pre-conversion state is frozen on the `archive` branch. Do not commit to it.
 
 - **Go 1.27**; one binary `ripper`; entrypoint `cmd/ripper/main.go` → `internal/cli`.
 - **cobra** (`serve [--headless]`, `detect [--raw]`, `healthcheck`, `version`). **viper** is the only
-  config loader and lives only in `internal/cli`. Config is a clean `RIPPER_*` set of 20 keys; the
-  legacy variable names are not supported. `RIPPER_DRIVES` takes several drives, which rip concurrently.
+  config loader and lives only in `internal/cli`. Config is a clean `RIPPER_*` set of 21 keys; the
+  legacy variable names are not supported. Drives are **auto-discovered** (`RIPPER_DRIVES` is only a filter).
 - **go-service-kit** v0.3.0: `lifecycle`, `obs`, `httpapi` (API/UI/docs `:9090`, admin `:9091`), `outbound`.
-- **Seams** (6): runner, detect, rip, eject, notify, meta. `internal/patchbay` selects the backends.
+- **Seams** (5): runner, detect, rip, eject, notify. `internal/patchbay` selects the backends.
+- **Engine**: one scan per tick → one watcher per drive → a FIFO **job queue** → a worker pool
+  (`RIPPER_MAX_PARALLEL_JOBS`, 0 = no cap; at most one job per drive).
 - **apprise-go** for notifications, and as the hook for automation after a rip.
 - **Web UI**: React 19 + Ant Design 6, embedded. **API docs**: Scalar, embedded, at `/docs`.
 - Observability: Slot 0 = Prometheus `/metrics` + JSON logs on stdout (fixed schema and message
-  catalogue), plus `/healthz` and `/readyz`. OTLP traces, metrics and logs go out when `OTEL_*` is set
-  (via go-service-kit `obs`). An in-memory log ring feeds the UI.
+  catalogue). Probes: `/livez`, `/startupz`, `/healthz` (dependency health) and `/readyz` (ready for work).
+  OTLP traces only, as go-service-kit does today; `internal/telemetry` is the one place to add OTLP
+  metrics/logs later. An in-memory log ring feeds the UI.
 - **Image**: distroless `gcr.io/distroless/cc-debian13` (no shell), with MakeMKV built from source at
   a pinned version, ELF tools copied with their library closure, and `tini-static` as PID 1.
-- **Audio CDs**: Go pipeline (cdparanoia TOC + MusicBrainz + `cdparanoia -B` + `flac`/`lame`);
-  abcde is gone.
+- **Audio CDs**: cyanrip (AccurateRip, MusicBrainz, cover art, ReplayGain), built from source;
+  abcde is gone. MakeMKV and cyanrip share one static ffmpeg.
 - Every rip is staged (`<kind>/.staging/`) and renamed into place. After any rip the engine waits
   for the disc to be removed.
 - User scripts (`/config/ripper.sh`, per-disc hooks) are removed. The conversion is **not 1-to-1**;
