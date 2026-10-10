@@ -75,7 +75,8 @@ Pinned versions (Renovate keeps them current afterwards):
 - Optional simpler variant (pick one and note it in the PR): instead of `go build`, re-exec the test
   binary itself: `TestMain` runs fakebin's `main` when `os.Getenv("FAKEBIN") == "1"`, and `Install`
   symlinks `os.Args[0]` under each tool name.
-- Test: one case per protocol row (per-call stdout/stderr/exit, each `creates` template, block/release,
+- Test: one case per protocol row, including the `<sub>` counter (`makemkvcon reg` then `info` → `info.1`)
+  and that `.block` never blocks an `info` scan (per-call stdout/stderr/exit, each `creates` template, block/release,
   SIGTERM → 143 without creates).
 - Done when: `go test ./internal/testutil/...` passes.
 
@@ -187,7 +188,8 @@ Pinned versions (Renovate keeps them current afterwards):
   - `calls.jsonl` argv and `dir`;
   - the profile override wins over the embedded default;
   - ddrescue passes both `.iso` and `.map`;
-  - cyanrip: success → files moved up and `name` returned; first exit 1 → a second call with `-N`;
+  - cyanrip: argv equals the C§3.6 Go argv exactly (including the `-D` literal and `-R 1`); success →
+    files moved up and `name` returned; first exit 1 → a second call with `-N` instead of `-R 1`;
     both fail → error; zero or two created folders → error; cancel → prompt return.
 
 **P2.3b cyanrip behaviour check (owner, hardware; does not block)**
@@ -209,7 +211,7 @@ Pinned versions (Renovate keeps them current afterwards):
   `context.DeadlineExceeded`; an invalid URL fails `New`; 10 concurrent `Notify` calls are serialised (race-free).
 
 **P2.6 `internal/makemkvkey`**
-- Do: C§5.5 (`FetchBetaKey`), `Register` (C§3.6, via `Output`, output discarded) and `RegistrationResult` (C§2.3).
+- Do: C§5.5 (`FetchBetaKey`), `Register` (C§3.6, via `Output` with a 30 s timeout, output discarded) and `RegistrationResult` (C§2.3).
 - Test: an httptest page with a key → the key; a page without → error; 500 → error.
   `Register` runs `makemkvcon reg <key>` via fakebin, and the key appears in no log record.
 
@@ -374,7 +376,7 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 - Test: hit every route in both modes.
 
 **P3.7 End-to-end smoke**
-- Do: T§4, every scenario, including `two_drives` and the observability assertions.
+- Do: T§4, every scenario, including `two_drives_parallel` and the observability assertions.
 - Phase done when: `task check` passes.
 
 ---

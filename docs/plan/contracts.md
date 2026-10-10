@@ -333,7 +333,7 @@ type DriveStatus struct {
 }
 
 type Job struct {
-	ID         string     `json:"id"`    // "<drive>-<YYYYMMDDHHMMSS>-<seq>"; seq = per-engine uint64 counter
+	ID         string     `json:"id"`    // fmt.Sprintf("%s-%s-%d", drive, now.Format("20060102150405"), seq); seq = per-engine uint64 counter
 	Drive      string     `json:"drive"`
 	Disc       disc.Disc  `json:"disc"`
 	State      JobState   `json:"state"`
@@ -437,7 +437,7 @@ An empty label never changes the classification.
    - Return.
 5. **State Empty, Open or Loading** → set state `idle`; return.
 6. **State Inserted** → log INFO `disc detected`; create
-   `Job{ID: "<drive>-<YYYYMMDDHHMMSS>-<seq>", State: queued, Disc: d, QueuedAt: Now()}`; append it to
+   `Job{ID: fmt.Sprintf("%s-%s-%d", drive, now.Format("20060102150405"), seq), State: queued, Disc: d, QueuedAt: Now()}`; append it to
    the FIFO queue; set the drive state to `queued`; log INFO `job queued`.
 
 **`dispatch()`** (under the mutex): while the queue is non-empty and
@@ -454,13 +454,14 @@ An empty label never changes the classification.
      - set the job `cancelled`; log WARN `job cancelled`;
      - `notifyDetached(Stopped, "Ripper stopped (<drive>)", "shutdown during rip of <label>", 3*time.Second)`;
      - **do not eject**; return.
-   - If `err != nil`: `Output.Cleanup`, set the job `failed` with the error, and skip the remaining steps.
+   - If `err != nil`: `Output.Cleanup` (on a Cleanup error log ERROR `cleanup failed`), set the job `failed`
+     with the error, and skip the remaining steps. The cancel-path Cleanup logs `cleanup failed` the same way.
    - Else: `path, err := Output.Finalize(kindDir, dir, name)` and append `path`. A Finalize error is a failure.
 3. If every step was skipped, the job is `skipped`. Otherwise it is `succeeded` if no step failed,
    else `failed`. Log INFO `job finished` (succeeded/skipped, with `path`, `duration_ms`) or ERROR `job failed` (with `error`).
 4. **Eject:**
    - If `cfg.Eject`: set the drive state to `ejecting` and call `Eject(ctx, device)`. An error is
-     logged at ERROR and doesn't change the job state.
+     logged at ERROR `eject failed` and doesn't change the job state.
    - If `!cfg.Eject`: log INFO `safe to eject`.
 5. Set `awaitingRemoval = true` and the drive state to `awaiting_removal`. This flag is what
    prevents re-rip loops after a failure, a failed eject, or when ejecting is off.
@@ -515,7 +516,7 @@ const (
   holds a `sync.Mutex` for its check-then-rename.
 - **Sanitise:** replace every rune not in `[A-Za-z0-9 ._-]` with `_`; trim leading/trailing spaces
   and dots; truncate to 100 bytes. Empty → `disc_<YYYYMMDD_HHMMSS>`.
-- **Timestamps** everywhere use the Go layout `20060102_150405`.
+- **Timestamps** in paths use the Go layout `20060102_150405` (job IDs use `20060102150405`, see §2.4).
 - **Prepare:** returns the absolute path of `<kindDir>/.staging/<YYYYMMDD_HHMMSS>-<drive>/<name>`,
   where `<name>` is the sanitised label. It is created with mode 0o777, so the umask applies.
 - **Finalize:**
@@ -536,13 +537,21 @@ const (
 | scan | `makemkvcon` | `-r --cache=1 info disc:9999` |
 | audio check | `cdparanoia` | `-d <device> -Q` |
 | BluRay/DVD rip | `makemkvcon` | `--profile=<profilePath> -r --decrypt --minlength=<MIN_TITLE_LENGTH> mkv disc:<Index> all <dir>` |
-| audio rip | `cyanrip` | `-s <offset> -d <device> -o <formats joined by ","> -D '{album}{if #releasecomment# > #0# (\|releasecomment\|)}/{format}' -T simple` with `Cmd.Dir = <dir>` (retry rule below). `<offset>` = `AudioOffsets()[driveID]`, default `0` |
+| audio rip | `cyanrip` | the Go argv below, with `Cmd.Dir = <dir>` (retry rule below) |
 | ISO | `ddrescue` | `<device> <dir>/<base(dir)>.iso <dir>/<base(dir)>.map` |
 | eject | `eject` | `-v <device>`. On error: wait 2 s, `sdparm --command=unlock <device>`, wait 1 s, `sdparm --command=eject <device>`; return the last error |
-| register | `makemkvcon` | `reg <KEY>` via `Output`; the output is discarded (never logged) |
+| register | `makemkvcon` | `reg <KEY>` via `Output` under `context.WithTimeout(ctx, 30*time.Second)`; the output is discarded (never logged) |
 
 - **profilePath:** `<CONFIG_DIR>/default.mmcp.xml` if it exists. Otherwise the embedded default,
   written once by `rip/makemkv.New` to `os.MkdirTemp("", "ripper-")`.
+- **cyanrip Go argv** (no shell is involved; each element is one argv entry):
+  ```go
+  []string{"-s", strconv.Itoa(offset), "-d", device, "-o", strings.Join(formats, ","), "-R", "1", "-D", "{album}{if #releasecomment# > #0# (|releasecomment|)}/{format}", "-T", "simple"}
+  ```
+  - `offset` = `AudioOffsets()[driveID]`, default `0`.
+  - The `-D` value is one element, exactly `{album}{if #releasecomment# > #0# (|releasecomment|)}/{format}`:
+    no quotes and no backslashes.
+  - `-R 1` picks the first MusicBrainz release when a disc matches several.
 - **cyanrip:**
   - It runs with its defaults: MusicBrainz lookup, Cover Art Archive cover, AccurateRip and EAC CRC
     verification, ReplayGain, and its default folder and file naming.
@@ -550,9 +559,9 @@ const (
   - `-s` is **mandatory**: without it cyanrip refuses to rip yet exits 0.
   - `-D` makes one album folder with one sub-folder per format (cyanrip requires `{format}` in the
     scheme when there are several formats), e.g. `<dir>/Album/FLAC/01 - Title.flac` and `<dir>/Album/MP3/…`.
-  - **Retry rule** (verified in cyanrip's source): a MusicBrainz miss or an unreachable MusicBrainz
-    exits 1 **before** ripping. If the first run exits non-zero, remove everything in `<dir>`, run once
-    more with `-N` added (no lookup; placeholder names), and log WARN `cyanrip retry without musicbrainz`.
+  - **Retry rule** (verified in cyanrip's source): a MusicBrainz miss, an ambiguous match or an
+    unreachable MusicBrainz exits 1 **before** ripping. If the first run exits non-zero, remove everything
+    in `<dir>`, then run once more with `"-R", "1"` replaced by `"-N"` (no lookup; placeholder names), and log WARN `cyanrip retry without musicbrainz`.
     AccurateRip and Cover Art Archive failures are not fatal.
   - **After success:** cyanrip has created exactly one directory `D` in `<dir>`. Move every entry of
     `<dir>/D` into `<dir>` (`os.Rename`), remove `D`, and return `name = D`. Zero or several
@@ -573,14 +582,16 @@ const (
 
 ### 3.8 Startup (`ripper serve`, before `lifecycle.Run`)
 
-1. Load and validate config (§1). On failure, print the joined error and exit 1.
+1. Load and validate config (§1). On failure, print the joined error to stderr (log ERROR `config invalid`
+   is not possible yet, as there is no logger) and exit 1.
 2. `syscall.Umask(int(cfg.Umask))` (Linux), before any file is created.
-3. `logring.New(2000)`; `tel, err := telemetry.Setup(ctx, telemetry.Config{...}, ring)` (§6.5).
+3. `logring.New(2000)`; `tel, err := telemetry.Setup(ctx, telemetry.Config{...}, ring)` (§6.5); log INFO
+   `ripper starting` with `version`.
 4. Get the key: `cfg.MakeMKVKey`, or if that's empty, `makemkvkey.FetchBetaKey` (client per §5.5).
    `os.MkdirAll(<home>/.MakeMKV, 0o700)` with `<home>` = `os.UserHomeDir()` (the image sets
    `HOME=/config`); `makemkvkey.Register`. Store the outcome in a `makemkvkey.RegistrationResult` for
    the `makemkv_registration` health check. Errors → log WARN `makemkv key registration failed` and continue.
-5. `output.NewPlanner` → `CleanStaging()`.
+5. `output.NewPlanner` → `CleanStaging()` → log INFO `staging cleaned`.
 6. `patchbay.Backends` → `engine.New` → `patchbay.Spec` → `lifecycle.Run`.
 
 `/startupz` turns OK once steps 1–6 have run **and** `engine.Started()` is true (§6.1).
@@ -769,7 +780,7 @@ c, err := outbound.New(outbound.Config{Product: "ripper", Version: version(),
 
 ### 5.6 `ripper detect`
 
-- Builds `execrunner` + `detect/makemkv`, calls `Detect` once, and prints a JSON array of every
+- Builds `execrunner` + `detect/makemkv`, calls `Detect(ctx, nil)` once, and prints a JSON array of every
   `disc.Disc` (indented) to stdout. `RIPPER_DRIVES` filters it, as in the engine.
 - Exit 0 for any result, including no drives. Exit 1 on a detect error (to stderr).
 - `--raw` also prints the raw `makemkvcon` output, then each raw `cdparanoia -Q` output, each under
@@ -890,7 +901,7 @@ Rules:
 | msg | level |
 |---|---|
 | `ripper starting` | INFO |
-| `config invalid` | ERROR |
+| `config invalid` | ERROR (stderr only; reserved, not emitted through the logger) |
 | `makemkv key registration failed` | WARN |
 | `staging cleaned` | INFO |
 | `drive discovered` | INFO |

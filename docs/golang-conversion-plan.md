@@ -279,7 +279,7 @@ Two trade-offs are accepted:
 - **apprise-go** is pre-1.0. It sits behind the `Notifier` seam; re-evaluate in phase 2.
 - **OTLP logs/metrics** are not exported yet (traces only, as in go-service-kit); adding them is a
   one-package change (C§6.5).
-- **cyanrip**: the retry rule is verified in cyanrip's source (a MusicBrainz miss exits 1 before ripping);
+- **cyanrip**: the retry rule is verified in cyanrip's source (a MusicBrainz miss or an ambiguous match exits 1 before ripping; ripper passes `-R 1` to pick the first release);
   P2.3b confirms it on hardware. `-s` (drive offset) is mandatory; without your drive's real offset
   (`RIPPER_AUDIO_DRIVE_OFFSETS`), AccurateRip can report mismatches.
 - **Unverified in this environment:** that Debian's `tini` ships `/usr/bin/tini-static` (fallback in P4.1);
