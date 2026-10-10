@@ -5,6 +5,9 @@ image that polls an optical drive, detects the disc type, rips it with the right
 tool, fixes ownership/permissions, ejects, and optionally sends a Pushover
 notification. A small web UI shows the tail of the rip log.
 
+Everything below "Repository map" describes the **current bash/python implementation**
+(the behaviour the Go port must match or deliberately change).
+
 The pre-conversion state is frozen on the `archive` branch. Do not commit to it.
 
 ## Engineering principles (apply to every change)
@@ -13,19 +16,34 @@ The pre-conversion state is frozen on the `archive` branch. Do not commit to it.
 - **DRY** — one implementation per behaviour (e.g. the DVD and BluRay handlers in
   `ripper.sh` are copy-paste twins; the Go port must have one video ripper).
 - **SOLID** — small single-purpose types; depend on narrow interfaces, not concretions.
-- **12-Factor** — config only from env; logs to stdout as an event stream; port
-  binding via env; fast startup and graceful shutdown (cancel context, stop children).
-- **Idiomatic / modern Go** — stdlib first (`log/slog`, `net/http` method+path
-  patterns, `embed`, `os/signal.NotifyContext`, `context`, `errors.Is/As`,
-  `testing/synctest`, `t.Context()`), interfaces declared by the consumer,
-  "accept interfaces, return structs", errors wrapped with `%w`, no globals,
-  `gofmt`/`go vet`/`staticcheck` clean, table-driven tests.
-- **Seams** — every side effect (process exec, filesystem, clock, HTTP, the drive
-  itself) sits behind a narrow interface so behaviour can be swapped without
-  editing the code that uses it. Tests plug fakes into the seams.
-- **Patchbay** — all concrete implementations are wired together in exactly one
-  place (the composition root, `cmd/ripper/main.go`). Packages never construct their
-  own collaborators; the patchbay "patches" real or fake components into the seams.
+- **12-Factor** — config from env (flags may override); logs to stdout as a JSON event
+  stream; port binding via env; fast startup and graceful shutdown (cancel context,
+  stop child processes, clean up partial output).
+- **Idiomatic / modern Go** — follow go.dev guidance (`cmd/<name>/main.go`, everything
+  else in `internal/`), stdlib first (`log/slog`, `net/http` method+path patterns,
+  `embed`, `context`, `errors.Is/As/Join`, `testing/synctest`, `t.Context()`),
+  "accept interfaces, return structs", errors wrapped with `%w`, no package-level
+  state, table-driven tests, golangci-lint (gofumpt, goimports, errorlint, gosec,
+  revive, bodyclose, noctx) clean.
+- **Seam** — one interface per capability (detect, rip, eject, notify, run a process,
+  MakeMKV key source). A seam has one or more **backends**, each in its own package,
+  each a drop-in implementation of that interface.
+- **Patchbay** — the single place that picks a backend for each seam and plugs it in
+  (`internal/patchbay`, called from the `serve` command). Swapping or adding a backend
+  is "add a package + one case in the patchbay (or a config value)", never a
+  refactor of the callers. Backends never construct other backends.
+
+## Target stack (decided — see `docs/golang-conversion-plan.md`)
+
+- Go 1.26; one binary `ripper`; entrypoint `cmd/ripper/main.go` → `internal/cli`.
+- **cobra** for commands (`serve`, `detect`, `healthcheck`, `version`); **viper** is the
+  only config loader (flags > env > defaults) and is imported only by `internal/cli`.
+- **go-service-kit** (`github.com/leftathome/go-service-kit`): `lifecycle` (signals,
+  workers, shutdown), `obs` (slog JSON + metrics + optional OTel), `httpapi` (huma
+  API listener + admin listener), `outbound` (all egress HTTP). Not `config`.
+- **apprise-go** (`github.com/unraid/apprise-go`) is the notification backend.
+- `ripper serve` = engine + API; web UI mounted unless `--headless`.
+- Images published to `ghcr.io/jacaudi/docker-ripper`. This fork diverges from upstream permanently.
 
 ## Repository map
 
@@ -156,11 +174,11 @@ Fixed paths: `/config` (state, log, overrides), `/out` (rips), `/ripper` (defaul
 | `cdparanoia -Q` | audio-CD fallback detection | Yes — `CDROM_DISC_STATUS` ioctl. |
 | `ddrescue` | ISO with bad-sector recovery | Keep (recovery logic is the point). |
 | `eject`, `sdparm` | eject / unlock tray | Yes — `CDROMEJECT`, `CDROM_LOCKDOOR` ioctls. |
-| `curl` | Pushover, key scrape | Yes — `net/http`. |
+| `curl` | Pushover, key scrape | Yes — apprise-go (notifications), kit `outbound` (key scrape). |
 | `grep/sed/cut/date/timeout` | text munging | Yes — stdlib. |
 | `useradd/groupadd` | named owners | Yes — numeric `os.Chown`, `os/user` lookup. |
-| python3, flask, waitress, docopt | web UI | Yes — `net/http` + `embed`. |
-| phusion `my_init`, syslog-ng | init / logging | Yes — single Go PID under `tini` (or `docker --init`). |
+| python3, flask, waitress, docopt | web UI | Yes — kit `httpapi` (huma) + `embed`. |
+| phusion `my_init`, syslog-ng | init / logging | Yes — kit `lifecycle` + `obs`, single Go process under `tini`. |
 | `ccextractor`, OpenJDK | used *by* MakeMKV | Keep in image. |
 
 ## Known bugs and quirks (do not silently "preserve" these in a port)
@@ -195,8 +213,11 @@ Fixed paths: `/config` (state, log, overrides), `/out` (rips), `/ripper` (defaul
 
 - `main` — upstream-tracking default.
 - `archive` — frozen snapshot of `main` before the Go conversion. Never commit to it.
-- `chore/claude-md` — adds this file.
+- `chore/claude-md` — this file.
 - `claude/golang-conversion-plan-*` — the Go conversion plan (`docs/golang-conversion-plan.md`).
+
+Images are published to `ghcr.io/jacaudi/docker-ripper` (decided; workflows still
+point at upstream Docker Hub until phase 5).
 
 ## Working in this repo
 
