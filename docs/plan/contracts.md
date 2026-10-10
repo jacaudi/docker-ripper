@@ -24,7 +24,10 @@ Module path: `github.com/jacaudi/docker-ripper`. All packages below live under i
 - Decode with `v.Unmarshal(&cfg)`. Each field has a `mapstructure:"<key>"` tag. Viper's default
   hooks already turn strings into `time.Duration` and comma-separated strings into `[]string`.
 - Booleans accept anything `strconv.ParseBool` accepts.
-- After decoding, call `cfg.Validate()`. It returns `errors.Join` of **every** problem it finds.
+- After decoding, call `cfg.Validate()`. It returns `errors.Join` of **every** problem it finds; each
+  error is `fmt.Errorf("%s: %s", ENV_NAME, reason)`.
+- Keys, defaults and env names are defined **once**, as a `[]struct{ key string; def any }` table in
+  `internal/cli/load.go`; `load` loops over it for `SetDefault` and `BindEnv`.
 
 ### 1.2 Keys (complete list)
 
@@ -37,6 +40,7 @@ Module path: `github.com/jacaudi/docker-ripper`. All packages below live under i
 | `RIPPER_ISO_MODE` | `iso_mode` / `ISOMode` | string | `off` | one of `off`, `also`, `only` |
 | `RIPPER_MIN_TITLE_LENGTH` | `min_title_length` / `MinTitleLength` | int (s) | `600` | ≥ 0; MakeMKV `--minlength` |
 | `RIPPER_AUDIO_FORMATS` | `audio_formats` / `AudioFormats` | []string | `flac,mp3` | ≥ 1 entry, no duplicates; each one of `flac`, `mp3`, `opus`, `aac`, `alac` (passed to cyanrip `-o`) |
+| `RIPPER_AUDIO_DRIVE_OFFSETS` | `audio_drive_offsets` / `AudioDriveOffsets` | []string | empty | each `<driveID>=<int>` (regex `^[A-Za-z0-9_-]+=-?[0-9]+$`), drive IDs unique. Read offset in samples passed to cyanrip `-s`; drives not listed use `0`. Look your drive up in the AccurateRip drive offset list |
 | `RIPPER_MAX_PARALLEL_JOBS` | `max_parallel_jobs` / `MaxParallelJobs` | int | `0` | ≥ 0; 0 = no cap (every drive may rip at once) |
 | `RIPPER_UID` | `uid` / `UID` | int | `-1` | ≥ −1; −1 = don't change the owner |
 | `RIPPER_GID` | `gid` / `GID` | int | `-1` | ≥ −1; −1 = don't change the group |
@@ -61,6 +65,13 @@ Module path: `github.com/jacaudi/docker-ripper`. All packages below live under i
 | log ring | 2000 records |
 | job history | 50 finished jobs |
 | health staleness | 3 × poll interval |
+
+Helpers on `config.Config` (computed from validated values; no extra keys):
+
+```go
+func (c Config) UmaskMode() fs.FileMode         // strconv.ParseUint(c.Umask, 8, 32)
+func (c Config) AudioOffsets() map[string]int   // parsed RIPPER_AUDIO_DRIVE_OFFSETS
+```
 
 **Drive ID** = `filepath.Base(device)` (`/dev/sr0` → `sr0`). It appears in staging paths, job IDs,
 the API, readiness, metric labels, log records and notification titles.
@@ -116,10 +127,12 @@ func (d Disc) DriveID() string // filepath.Base(d.Device)
 // String and MarshalText return: "unknown","empty","open","loading","inserted"
 func (s State) String() string
 func (s State) MarshalText() ([]byte, error)
+func (s *State) UnmarshalText(b []byte) error // required: huma emits a string schema only for TextUnmarshaler types
 
 // String and MarshalText return: "none","bluray","dvd","cd","audio_cd","data"
 func (k Kind) String() string
 func (k Kind) MarshalText() ([]byte, error)
+func (k *Kind) UnmarshalText(b []byte) error
 ```
 
 ### 2.2 Seams (five; the interface lives in the seam package, backends in sub-packages)
@@ -157,8 +170,10 @@ package detect
 
 type Detector interface {
 	// Detect scans once and returns every drive the system sees, in index order.
-	// No returned Disc has Kind KindCD.
-	Detect(ctx context.Context) ([]disc.Disc, error)
+	// busy lists devices that have a running job: they are not probed with cdparanoia
+	// (the ripper owns the device), so they may come back with Kind KindCD.
+	// No other returned Disc has Kind KindCD.
+	Detect(ctx context.Context, busy []string) ([]disc.Disc, error)
 }
 ```
 
@@ -217,12 +232,12 @@ Every backend is a **single shared instance**. The device comes from `disc.Disc.
 | `internal/runner/execrunner` | `New(logger *slog.Logger, tracer trace.Tracer, meter metric.Meter) (*Runner, error)` | `runner.Runner` |
 | `internal/detect/makemkv` | `New(r runner.Runner, timeout time.Duration) *Detector`; `func ParseDRV(out []byte) ([]disc.Disc, error)`; `ErrMalformed` | `detect.Detector` |
 | `internal/rip/makemkv` | `New(r runner.Runner, configDir string, minLength int) (*Ripper, error)`; embeds `default.mmcp.xml` | `rip.Ripper` |
-| `internal/rip/cyanrip` | `New(r runner.Runner, formats []string) *Ripper` | `rip.Ripper` |
+| `internal/rip/cyanrip` | `New(r runner.Runner, formats []string, offsets map[string]int) *Ripper` | `rip.Ripper` |
 | `internal/rip/ddrescue` | `New(r runner.Runner) *Ripper` | `rip.Ripper` |
 | `internal/eject/execeject` | `New(r runner.Runner) *Ejector` | `eject.Ejector` |
 | `internal/notify/apprise` | `New(urls []string) (*Notifier, error)` | `notify.Notifier` |
 | `internal/notify/nop` | `type Notifier struct{}` | `notify.Notifier` |
-| `internal/makemkvkey` | `FetchBetaKey(ctx, d outbound.Doer, url string) (string, error)`; `const ForumURL`; `Register(ctx, r runner.Runner, key string) error` | — (functions) |
+| `internal/makemkvkey` | `FetchBetaKey(ctx, d outbound.Doer, url string) (string, error)`; `const ForumURL`; `Register(ctx, r runner.Runner, key string) error` (runs via `Output` and **discards** the output, which may echo the key); `type RegistrationResult struct{ Err error }` (`Err = errors.New("no MakeMKV key")` when there is neither a configured nor a fetched key) | — (functions) |
 | `internal/output` | `Planner` (§3.5) | — |
 | `internal/logring` | `New(capacity int) *Ring`; `(*Ring).Write([]byte) (int, error)`; `(*Ring).Lines(n int) []string` | `io.Writer` |
 | `internal/telemetry` | §6.5 | — |
@@ -307,6 +322,7 @@ func (e *Engine) CheckLoop(ctx context.Context) error    // error if the loop he
 func (e *Engine) CheckDrives(ctx context.Context) error  // error if no discovered drive is in a state other than unusable
 
 type DriveStatus struct {
+	Job          *Job       `json:"job,omitempty"` // the drive's current job, else its last finished job
 	Drive        string     `json:"drive"`
 	Device       string     `json:"device"`
 	State        DriveState `json:"state"`
@@ -317,7 +333,7 @@ type DriveStatus struct {
 }
 
 type Job struct {
-	ID         string     `json:"id"`    // "<drive>-<YYYYMMDDHHMMSS>"
+	ID         string     `json:"id"`    // "<drive>-<YYYYMMDDHHMMSS>-<seq>"; seq = per-engine uint64 counter
 	Drive      string     `json:"drive"`
 	Disc       disc.Disc  `json:"disc"`
 	State      JobState   `json:"state"`
@@ -336,10 +352,11 @@ type Job struct {
 ### 3.1 DRV parsing (`makemkv.ParseDRV` in `detect/makemkv`)
 
 1. Iterate lines with `strings.Lines`. Keep lines that start with `DRV:`.
-2. Parse `strings.TrimPrefix(line, "DRV:")` with `csv.NewReader` (`LazyQuotes: true`,
+2. Parse `strings.TrimPrefix(strings.TrimSuffix(line, "\n"), "DRV:")` with `csv.NewReader` (`LazyQuotes: true`,
    `FieldsPerRecord: -1`). Fewer than 7 fields → `ErrMalformed`.
 3. Fields: `[0]` index (int), `[1]` state (int), `[2]` ignored, `[3]` flags (int),
-   `[4]` drive name, `[5]` label, `[6]` device.
+   `[4]` drive name, `[5]` label, `[6]` device. A non-integer index → `ErrMalformed`; a
+   non-integer state or flags → State Unknown (the line is still returned).
 4. **Skip** lines whose device field is empty (absent drives, e.g. `DRV:5,256,999,0,"","",""`).
 5. Classify each remaining line, in this order:
 
@@ -362,8 +379,8 @@ An empty label never changes the classification.
 1. Call `Output(ctxWithTimeout(30s), {Name:"makemkvcon", Args:["-r","--cache=1","info","disc:9999"], Tool:"makemkvcon"})`.
    On error (including a timeout), return `nil, err`. That is a **scanner** failure.
 2. `discs, err := ParseDRV(out)`. On error, return `nil, err`.
-3. For each disc with `Kind == KindCD` or `State == StateEmpty`, run
-   `Output(ctx, {Name:"cdparanoia", Args:["-d", device, "-Q"], Tool:"cdparanoia"})` and ignore its exit code.
+3. For each disc whose device is **not** in `busy` and that has `Kind == KindCD` or `State == StateEmpty`, run
+   `Output(ctxWithTimeout(30s), {Name:"cdparanoia", Args:["-d", device, "-Q"], Tool:"cdparanoia"})` and ignore its exit code.
    - Output contains `audio tracks` → State Inserted, Kind AudioCD.
    - Otherwise, if Kind was CD → Kind Data.
    - Otherwise, if State was Empty → it stays Empty.
@@ -371,17 +388,26 @@ An empty label never changes the classification.
 
 ### 3.3 Engine
 
+**Concurrency rules (follow exactly)**
+- `Run` stores `e.ctx = ctx` before the first scan. `dispatch` and `execute` use `e.ctx`.
+- One `sync.Mutex` guards drives, queue, history and counters. It is **never** held across
+  `Detect`, `Prepare`, `Rip`, `Finalize`, `Cleanup`, `Eject` or `Notify`, and never across `wg.Wait`.
+  Notifications are sent after unlocking.
+- `wg.Go` is only called from `dispatch`, which runs on the Run goroutine (before cancellation) or
+  from a running job (so the WaitGroup is non-empty). This keeps `WaitGroup`'s "Go before Wait" rule.
+- `dispatch` starts nothing once `e.ctx.Err() != nil`.
+
 **`Run(ctx)`**
 - Create a ticker: `time.NewTicker(cfg.PollInterval)`.
 - Run one **scan** immediately, then one per tick. Each scan updates the loop heartbeat.
 - On `ctx.Done()`:
   - stop the ticker;
-  - mark every queued job `cancelled`;
-  - wait for the running jobs (they see the cancelled ctx and clean up);
+  - under the mutex: mark every queued job `cancelled`, move them to history, and empty the queue;
+  - **release the mutex**, then `wg.Wait()` (running jobs see the cancelled ctx and clean up);
   - return `nil`.
 
 **Scan**
-1. `discs, err := Detect(ctx)`.
+1. `discs, err := Detect(ctx, busy)`, where `busy` = the devices of running jobs.
    - On error: `scanFailures++`; log WARN `detect failed`. When `scanFailures` first reaches
      `BadThreshold`: `notifyDetached(Failure, "Drive scan failing", err)`. Set `started = true`. End the scan.
    - On success: `scanFailures = 0`, `lastScanOK = Now()`, `started = true`.
@@ -397,48 +423,54 @@ An empty label never changes the classification.
 **`observe(d)` — per drive, in this order**
 1. `State == Unknown`:
    - `bad++`; log WARN `detect failed` with `drive` and `raw`.
-   - When `bad` first reaches `BadThreshold`: set the drive state to `unusable` and
-     `notifyDetached(Failure, "Drive not responding (<drive>)", "<raw>")`.
+   - When `bad` first reaches `BadThreshold`: set the drive state to `unusable`, log ERROR
+     `drive not responding`, and `notifyDetached(Failure, "Drive not responding (<drive>)", "<raw>")`.
    - Return.
 2. Otherwise `bad = 0`. If the drive state is `unusable`, set it to `idle`.
-3. If the drive has a queued or running job, update `LastSeen` and return.
+3. If the drive has a **running** job, update `LastSeen` and return.
+   If it has a **queued** job and the State is not Inserted or Loading (the disc was removed before
+   its turn): remove the job from the queue, mark it `cancelled`, move it to history, set the drive
+   `idle`, log WARN `job cancelled`, and return. Otherwise (still inserted) return.
 4. **If `awaitingRemoval`:**
    - State Empty or Open → clear the flag, set state `idle`, log INFO `disc removed`.
    - Otherwise log DEBUG `waiting for disc removal`.
    - Return.
 5. **State Empty, Open or Loading** → set state `idle`; return.
-6. **State Inserted** → create `Job{ID: "<drive>-<YYYYMMDDHHMMSS>", State: queued, Disc: d, QueuedAt: Now()}`.
-   Append it to the FIFO queue, set the drive state to `queued`, and log INFO `job queued`.
+6. **State Inserted** → log INFO `disc detected`; create
+   `Job{ID: "<drive>-<YYYYMMDDHHMMSS>-<seq>", State: queued, Disc: d, QueuedAt: Now()}`; append it to
+   the FIFO queue; set the drive state to `queued`; log INFO `job queued`.
 
 **`dispatch()`** (under the mutex): while the queue is non-empty and
 (`MaxParallel == 0` or running < `MaxParallel`), pop the oldest job, mark it `running`, and start
 `wg.Go(func() { e.execute(ctx, job) })`. It is called after every scan and after every finished job.
 
 **`execute(ctx, job)`**
-1. Set the drive state to `ripping`; `StartedAt = Now()`; start the `engine.job` span.
+1. Set the drive state to `ripping`; `StartedAt = Now()`; start the `engine.job` span; log INFO `job started`.
 2. Run the rip plan (§3.4) step by step. For each step:
    - `dir, err := Output.Prepare(kindDir, job.Drive, job.Disc.Label, Now())`.
    - `name, err := ripper.Rip(ctx, job.Disc, dir)`.
    - **If `ctx.Err() != nil` (shutdown):**
      - `Output.Cleanup(cctx, dir)`, where `cctx` is `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`;
-     - set the job `cancelled`;
-     - `notifyDetached(Stopped, "Ripper stopped (<drive>)", "shutdown during rip of <label>")`;
+     - set the job `cancelled`; log WARN `job cancelled`;
+     - `notifyDetached(Stopped, "Ripper stopped (<drive>)", "shutdown during rip of <label>", 3*time.Second)`;
      - **do not eject**; return.
    - If `err != nil`: `Output.Cleanup`, set the job `failed` with the error, and skip the remaining steps.
    - Else: `path, err := Output.Finalize(kindDir, dir, name)` and append `path`. A Finalize error is a failure.
-3. If every step was skipped, the job is `skipped`. Otherwise it is `succeeded` if no step failed.
+3. If every step was skipped, the job is `skipped`. Otherwise it is `succeeded` if no step failed,
+   else `failed`. Log INFO `job finished` (succeeded/skipped, with `path`, `duration_ms`) or ERROR `job failed` (with `error`).
 4. **Eject:**
    - If `cfg.Eject`: set the drive state to `ejecting` and call `Eject(ctx, device)`. An error is
      logged at ERROR and doesn't change the job state.
    - If `!cfg.Eject`: log INFO `safe to eject`.
 5. Set `awaitingRemoval = true` and the drive state to `awaiting_removal`. This flag is what
    prevents re-rip loops after a failure, a failed eject, or when ejecting is off.
-6. Notify: `Success` (succeeded) or `Failure` (failed); nothing for skipped. `FinishedAt = Now()`.
-   Move the job to history (keep at most `HistoryLimit`). Call `dispatch()`.
+6. `FinishedAt = Now()`; move the job to history (keep at most `HistoryLimit`); unlock; then
+   `notifyDetached(Success|Failure, …, 15*time.Second)` (nothing for skipped); then `dispatch()`.
 
-`notifyDetached(e)` calls `Notify(ctx', e)`, where `ctx'` is
-`context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)`. Its errors are logged at WARN and
-never change a job.
+`notifyDetached(e, timeout)` calls `Notify(ctx', e)`, where `ctx'` is
+`context.WithTimeout(context.WithoutCancel(e.ctx), timeout)`. Use **3 s** on the shutdown path (it
+must fit the 15 s stop budget: process-group kill ≤ 5 s + cleanup ≤ 5 s + notify ≤ 3 s), and
+**15 s** everywhere else. Errors are logged at WARN `notification failed` and never change a job.
 
 All log records from a job carry `drive` and `job_id` (`logger.With(...)`).
 
@@ -465,7 +497,7 @@ func (p *Planner) CleanStaging() error
 func (p *Planner) Prepare(kindDir, drive, label string, now time.Time) (dir string, err error)
 func (p *Planner) Finalize(kindDir, dir, name string) (path string, err error)
 func (p *Planner) Cleanup(ctx context.Context, dir string) error
-func (p *Planner) CheckWritable(ctx context.Context) error // create + remove "<OutputDir>/.healthcheck-<pid>"
+func (p *Planner) CheckWritable(ctx context.Context) error // Root.OpenFile(".healthcheck-<pid>-<rand>", O_CREATE|O_EXCL|O_WRONLY, 0o600), close, remove
 func (p *Planner) Close() error
 func Sanitize(s string) string // the rule below, without the empty-string fallback
 
@@ -483,6 +515,7 @@ const (
   holds a `sync.Mutex` for its check-then-rename.
 - **Sanitise:** replace every rune not in `[A-Za-z0-9 ._-]` with `_`; trim leading/trailing spaces
   and dots; truncate to 100 bytes. Empty → `disc_<YYYYMMDD_HHMMSS>`.
+- **Timestamps** everywhere use the Go layout `20060102_150405`.
 - **Prepare:** returns the absolute path of `<kindDir>/.staging/<YYYYMMDD_HHMMSS>-<drive>/<name>`,
   where `<name>` is the sanitised label. It is created with mode 0o777, so the umask applies.
 - **Finalize:**
@@ -503,10 +536,10 @@ const (
 | scan | `makemkvcon` | `-r --cache=1 info disc:9999` |
 | audio check | `cdparanoia` | `-d <device> -Q` |
 | BluRay/DVD rip | `makemkvcon` | `--profile=<profilePath> -r --decrypt --minlength=<MIN_TITLE_LENGTH> mkv disc:<Index> all <dir>` |
-| audio rip | `cyanrip` | `-d <device> -o <formats joined by ",">` with `Cmd.Dir = <dir>` (retry rule below) |
+| audio rip | `cyanrip` | `-s <offset> -d <device> -o <formats joined by ","> -D '{album}{if #releasecomment# > #0# (\|releasecomment\|)}/{format}' -T simple` with `Cmd.Dir = <dir>` (retry rule below). `<offset>` = `AudioOffsets()[driveID]`, default `0` |
 | ISO | `ddrescue` | `<device> <dir>/<base(dir)>.iso <dir>/<base(dir)>.map` |
 | eject | `eject` | `-v <device>`. On error: wait 2 s, `sdparm --command=unlock <device>`, wait 1 s, `sdparm --command=eject <device>`; return the last error |
-| register | `makemkvcon` | `reg <KEY>` |
+| register | `makemkvcon` | `reg <KEY>` via `Output`; the output is discarded (never logged) |
 
 - **profilePath:** `<CONFIG_DIR>/default.mmcp.xml` if it exists. Otherwise the embedded default,
   written once by `rip/makemkv.New` to `os.MkdirTemp("", "ripper-")`.
@@ -514,12 +547,16 @@ const (
   - It runs with its defaults: MusicBrainz lookup, Cover Art Archive cover, AccurateRip and EAC CRC
     verification, ReplayGain, and its default folder and file naming.
   - It never gets `-Q` (eject); the engine ejects.
-  - **Retry rule:** if the first run exits non-zero, run it once more with `-N` added (no MusicBrainz
-    lookup; placeholder names) and log WARN `cyanrip retry without musicbrainz`. This covers discs
-    that aren't in MusicBrainz. The exact miss behaviour is checked on hardware in P2.3b.
-  - **After success:** cyanrip has created exactly one directory `D` in `<dir>`. Move every entry
-    of `<dir>/D` into `<dir>` (`os.Rename`, same directory tree), remove `D`, and return `name = D`.
-    Zero or several directories → error.
+  - `-s` is **mandatory**: without it cyanrip refuses to rip yet exits 0.
+  - `-D` makes one album folder with one sub-folder per format (cyanrip requires `{format}` in the
+    scheme when there are several formats), e.g. `<dir>/Album/FLAC/01 - Title.flac` and `<dir>/Album/MP3/…`.
+  - **Retry rule** (verified in cyanrip's source): a MusicBrainz miss or an unreachable MusicBrainz
+    exits 1 **before** ripping. If the first run exits non-zero, remove everything in `<dir>`, run once
+    more with `-N` added (no lookup; placeholder names), and log WARN `cyanrip retry without musicbrainz`.
+    AccurateRip and Cover Art Archive failures are not fatal.
+  - **After success:** cyanrip has created exactly one directory `D` in `<dir>`. Move every entry of
+    `<dir>/D` into `<dir>` (`os.Rename`), remove `D`, and return `name = D`. Zero or several
+    directories → error. (cyanrip creates folders with mode 0700; Finalize's recursive chmod fixes that.)
 
 ### 3.7 Notifications
 
@@ -540,8 +577,9 @@ const (
 2. `syscall.Umask(int(cfg.Umask))` (Linux), before any file is created.
 3. `logring.New(2000)`; `tel, err := telemetry.Setup(ctx, telemetry.Config{...}, ring)` (§6.5).
 4. Get the key: `cfg.MakeMKVKey`, or if that's empty, `makemkvkey.FetchBetaKey` (client per §5.5).
-   `os.MkdirAll(<home>/.MakeMKV, 0o700)`; `makemkvkey.Register`. Record the result for the
-   `makemkv_registration` health check. Errors → log WARN and continue.
+   `os.MkdirAll(<home>/.MakeMKV, 0o700)` with `<home>` = `os.UserHomeDir()` (the image sets
+   `HOME=/config`); `makemkvkey.Register`. Store the outcome in a `makemkvkey.RegistrationResult` for
+   the `makemkv_registration` health check. Errors → log WARN `makemkv key registration failed` and continue.
 5. `output.NewPlanner` → `CleanStaging()`.
 6. `patchbay.Backends` → `engine.New` → `patchbay.Spec` → `lifecycle.Run`.
 
@@ -629,7 +667,7 @@ Both also set `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referre
 
 **Scalar page** (`internal/apidocs/assets/docs.html`):
 - Loads `assets/standalone.js` and then `assets/docs-init.js`. No inline script.
-- `docs-init.js` calls `Scalar.createApiReference('#app', {url: './openapi.json', withDefaultFonts: false, telemetry: false, hideTestRequestButton: true, hideClientButton: true})`.
+- `docs-init.js` calls `Scalar.createApiReference('#app', {url: './openapi.json', withDefaultFonts: false, telemetry: false, hideTestRequestButton: true, hideClientButton: true, proxyUrl: '', documentDownloadType: 'none'})`.
 
 ---
 
@@ -659,7 +697,13 @@ if ctx.Err() != nil && cmd.Process != nil {
 ```
 
 - Log DEBUG `exec` with `tool`. **Argv is never logged.**
-- Each output line → `logger.InfoContext(ctx, "tool output", "tool", c.Tool, "line", line)`.
+- Each output line → `logger.InfoContext(ctx, "tool output", "tool", c.Tool, "line", line)`, **except**
+  lines starting with `PRGV:`, `PRGC:` or `PRGT:` (MakeMKV progress, several per second), which are dropped.
+- After the process ends: DEBUG `tool finished` (`tool`, `duration_ms`) on success; WARN `tool failed`
+  (`tool`, `exit_code`, `error`) on failure.
+- `Output` collects into a `limitedBuffer` (stops appending after 1 MiB) used for both stdout and
+  stderr; its lines are not logged as `tool output`.
+- Metric `result` label: ctx error → `cancelled`; `*exec.ExitError` → `exit_error`; any other error → `error`; else `ok`.
 - Each Run/Output is wrapped in a `tool.run` span (§6.4) and records `ripper.tool.runs` and
   `ripper.tool.duration` (§6.2).
 - Errors:
@@ -671,11 +715,11 @@ if ctx.Err() != nil && cmd.Process != nil {
 
 ```go
 func (n *Notifier) Notify(ctx context.Context, e notify.Event) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second) // upper bound; callers may pass a shorter ctx
 	defer cancel()
 	done := make(chan error, 1) // buffered: the goroutine never blocks if we time out
 	go func() {
-		n.mu.Lock() // apprise-go keeps package-level HTTP state: never Send concurrently
+		n.mu.Lock() // apprise-go swaps package-level HTTP options per Send: serialise sends
 		defer n.mu.Unlock()
 		done <- n.a.Send(e.Body, apprise.WithTitle(e.Title), apprise.WithNotifyType(typeOf(e.Kind)))
 	}()
@@ -704,7 +748,8 @@ Let `u` be the umask.
 - **Directories:** `0o777 &^ u`.
 - **Files:** `0o777 &^ u` if the file already has any execute bit, else `0o666 &^ u`.
 - Never add execute to a file.
-- Apply recursively with `Root.Chmod`. Then, if `UID >= 0 || GID >= 0`, call
+- Apply recursively: `fs.WalkDir(p.root.FS(), rel, …)` and `p.root.Chmod` for each entry
+  (`os.Root` has no walk method). Then, if `UID >= 0 || GID >= 0`, call
   `Root.Lchown(path, UID, GID)` (−1 leaves that part unchanged).
 
 ### 5.5 Outbound client for the key fetch
@@ -773,10 +818,12 @@ is go-service-kit's current behaviour; §6.5 explains how to extend it later.
   - **replace** `m["GET /healthz"]` with the health instance's handler;
   - add `"GET /livez"` (static `ok`) and `"GET /startupz"`;
   - register every entry on a new `http.ServeMux`;
-  - build `&http.Server{Addr, Handler: mux, ReadHeaderTimeout, ReadTimeout, WriteTimeout, IdleTimeout, MaxHeaderBytes}`
+  - build `&http.Server{Addr, Handler: mux, ReadHeaderTimeout, ReadTimeout, WriteTimeout, IdleTimeout, MaxHeaderBytes, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn)}`
     from `httpapi.Timeouts{}.WithDefaults()`.
-- `ripper healthcheck` GETs `http://127.0.0.1:<port of RIPPER_ADMIN_ADDR>/healthz` with a 2 s
-  timeout, prints the body, and exits 0 on 200, else 1.
+- `config_dir` check: `os.CreateTemp(cfg.ConfigDir, ".healthcheck-*")`, close, remove.
+- When a check fails, the check function logs WARN `health check failed` with `check` and `error`.
+- `ripper healthcheck` GETs `http://127.0.0.1:<port of RIPPER_ADMIN_ADDR>/healthz` with a 3 s
+  timeout (the checks themselves have 2 s), prints the body, and exits 0 on 200, else 1.
 
 This follows the Kubernetes probe convention (liveness / readiness / startup), plus a dependency
 health endpoint as you defined it. Liveness deliberately checks nothing, so a dependency failure
@@ -901,6 +948,7 @@ package telemetry
 
 type Config struct {
 	ServiceName, ServiceVersion, LogLevel string
+	Output       io.Writer             // tests only; nil = os.Stdout
 	SpanExporter sdktrace.SpanExporter // tests only; passed to obs.Config.SpanExporter. nil in production
 }
 
@@ -914,7 +962,7 @@ type Telemetry struct {
 	Shutdown       func(context.Context) error // flushes everything; wired as lifecycle.Spec.Flush
 }
 
-// Setup calls obs.Setup with LogOutput = io.MultiWriter(os.Stdout, ring) and adapts the result.
+// Setup calls obs.Setup with LogOutput = io.MultiWriter(Output or os.Stdout, ring) and adapts the result.
 func Setup(ctx context.Context, c Config, ring io.Writer) (*Telemetry, error)
 ```
 
@@ -925,4 +973,9 @@ its `obs` supports it):
 - Logs: when `OTEL_LOGS_EXPORTER` includes `otlp`, fan out with
   `slog.NewMultiHandler(json, redact(otelslog.NewHandler(…)))`.
 
-No instrumentation code changes in either case. This is recorded under "Future" in phases.md.
+No instrumentation code changes in either case.
+
+**Test-import rule:** `_test.go` files anywhere may import `go.opentelemetry.io/otel/sdk/metric`
+(`NewManualReader`), `…/sdk/metric/metricdata`, `…/sdk/trace/tracetest`, `go.opentelemetry.io/otel/metric/noop`
+and `go.opentelemetry.io/otel/trace/noop`. Non-test code outside `internal/telemetry` may import only
+the OTel **API** packages (`otel/trace`, `otel/metric`, `otel/attribute`, `otel/codes`). This is recorded under "Future" in phases.md.

@@ -31,7 +31,11 @@ without a drive. Real hardware is checked once, at cutover (P4.5).
   - recording `Ripper`, `Ejector` and `Notifier`;
   - a `BlockingRipper` that returns only when its ctx is done, or when the test releases it per drive.
 - Tests that run `lifecycle.Run` (patchbay only) use real listeners on `127.0.0.1:0` passed via
-  `Spec.Listeners`, and stop by cancelling the context.
+  `Spec.Listeners` (paired by index with `Spec.Servers`), and stop by cancelling the context.
+- Tests that don't assert on metrics or spans pass `noop.NewMeterProvider().Meter("test")` and
+  `noop.NewTracerProvider().Tracer("test")` (`go.opentelemetry.io/otel/metric/noop`, `…/trace/noop`).
+  Tests that do assert use `sdkmetric.NewManualReader()` and `tracetest.NewInMemoryExporter()` (C§6.5 test-import rule).
+- Inside `synctest.Test`, `Deps.Now` is `time.Now` (the bubble's fake clock).
 
 ## 2. Fixtures
 
@@ -45,11 +49,17 @@ internal/detect/makemkv/testdata/cdparanoia/<case>.txt  raw `cdparanoia -d /dev/
   - single drive: `empty`, `open`, `loading`, `dvd`, `bluray`, `uhd`, `cd`, `blank_label_dvd`;
   - `two_drives_bd_cd` (sr0 bluray, sr1 cd); `index_10`;
   - `no_drives` (every line has an empty device → empty slice);
-  - `garbage` (→ `ErrMalformed`).
+  - `garbage`: contains `MSG:` lines and one line `DRV:0,2,999` (fewer than 7 fields) → `ErrMalformed`;
+  - `bad_state`: the bluray fixture with the state field replaced by `x` → State Unknown.
 - Required cdparanoia cases: `audio`, `no_audio`.
-- Synthetic files look like real output: `MSG:` lines first, then `DRV:0..15`, with absent drives
-  as `DRV:N,256,999,0,"","",""`. Example target line:
-  `DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE  WH16NS40 1.05","MOVIE","/dev/sr0"`.
+- Synthetic files look like real output. Full example, `bluray.txt`:
+  ```
+  MSG:1005,0,1,"MakeMKV v1.18.0 linux(x64-release) started","%1 started","MakeMKV v1.18.0 linux(x64-release)"
+  MSG:2010,0,1,"Optical drive \"BD-RE HL-DT-ST BD-RE  WH16NS40 1.05\" opened in OS access mode.","",""
+  DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE  WH16NS40 1.05","MOVIE","/dev/sr0"
+  DRV:1,256,999,0,"","",""
+  …                                   (one line per index up to DRV:15, all like DRV:1)
+  ```
 - **Hardware captures replace synthetic files 1:1.** The owner runs `ripper detect --raw` (C§5.6)
   per disc type and pastes the output into the matching `.txt`. If the expectation table then fails,
   the hardware is right: fix the table and the contract together.
@@ -67,20 +77,20 @@ Tool name = `filepath.Base(os.Args[0])`. `<dev>` = the basename of the first arg
 
 | File in `$FAKEBIN_DIR` | Meaning |
 |---|---|
-| `calls.jsonl` | fakebin appends `{"tool":"<name>","args":[...],"dir":"<cwd>"}` + `\n` (`O_APPEND`) |
+| `calls.jsonl` | fakebin appends `{"tool":"<name>","args":[...],"dir":"<cwd>","pid":<os.Getpid()>}` + `\n` (`O_APPEND`). `fakebintest.Call` is `struct{ Tool string; Args []string; Dir string; PID int }` |
 | `<tool>.count` | per-tool call counter, maintained by fakebin (1-based) |
 | `<tool>.<n>.stdout` / `<tool>.<dev>.stdout` / `<tool>.stdout` | stdout for call n, else for the device, else the default. Missing = no output |
 | `<tool>.<n>.stderr` / `<tool>.<dev>.stderr` / `<tool>.stderr` | same lookup order, for stderr |
 | `<tool>.<n>.exit` / `<tool>.<dev>.exit` / `<tool>.exit` | exit code as a decimal (default `0`), same lookup order |
 | `<tool>.creates` | one path template per line, each created as a file containing `fake` (parents created). Templates: `{arg:N}`, `{lastarg}`, `{flag:X}` (the arg after flag `X`), `{cwd}`. Applied only for a `makemkvcon` call whose args contain `mkv`, and always for `ddrescue` and `cyanrip` |
-| `<tool>.block` / `<tool>.<dev>.block` | if present: after recording the call, block until `<tool>[.<dev>].release` exists (poll 50 ms) or SIGTERM arrives. On SIGTERM exit 143 **without** applying `creates` |
+| `<tool>.block` / `<tool>.<dev>.block` | if present: after recording the call, block until `<tool>[.<dev>].release` exists (poll 50 ms) or SIGTERM arrives (`signal.Notify(c, syscall.SIGTERM)`). On SIGTERM exit 143 **without** applying `creates` |
 
 Typical setups:
 - **BluRay:** `makemkvcon.1.stdout` = the bluray fixture; `makemkvcon.3.stdout` = the empty
   fixture (call 2 is the rip); `makemkvcon.creates` = `{lastarg}/title_t00.mkv`.
 - **ISO:** `ddrescue.creates` = `{arg:1}` and `{arg:2}` (the `.iso` and `.map` files).
-- **Audio CD:** `cyanrip.creates` = `{cwd}/Artist - Album/01 - Song 1.flac` and
-  `{cwd}/Artist - Album/02 - Song 2.mp3`. For the retry: `cyanrip.1.exit` = `1`.
+- **Audio CD:** `cyanrip.creates` = `{cwd}/Artist - Album/FLAC/01 - Song 1.flac` and
+  `{cwd}/Artist - Album/MP3/01 - Song 1.mp3`. For the retry: `cyanrip.1.exit` = `1`.
 
 ## 4. End-to-end smoke (`internal/patchbay/e2e_test.go`)
 
@@ -88,7 +98,8 @@ Typical setups:
   - `RIPPER_OUTPUT_DIR` = temp dir; `RIPPER_POLL_INTERVAL=1s`; `RIPPER_HEADLESS=true`;
   - apprise target `json://127.0.0.1:<port>` pointing at an `httptest` server;
   - listeners on `127.0.0.1:0`; fakebin on `PATH`;
-  - fake device paths are temp files named `sr0`/`sr1`, and the fixtures list those paths.
+  - fake device paths are temp files named `sr0`/`sr1`. The test writes `makemkvcon.N.stdout` by
+    replacing `/dev/sr0` and `/dev/sr1` in the fixture text with those temp paths.
 - Run `lifecycle.Run` in a goroutine.
 - Poll `GET /api/v1/jobs` until the expected jobs are finished (timeout 20 s), then cancel and wait
   for `Run` to return.
@@ -96,8 +107,9 @@ Typical setups:
 | Scenario | Setup | Assert |
 |---|---|---|
 | `bluray` | bluray then empty | `mkv … disc:0 all <staging>`, then eject; `BluRay/MOVIE/title_t00.mkv`; no `.staging` left; job `succeeded`; Success notification; drive back to `idle` after empty |
-| `audio_cd` | cd + cdparanoia `audio` | `cyanrip -d <dev> -o flac,mp3` run in the staging dir; `CD/Artist - Album/01 - Song 1.flac`; job `succeeded` |
-| `audio_cd_retry` | as above, `cyanrip.1.exit=1` | a second cyanrip call with `-N`; job `succeeded`; WARN `cyanrip retry without musicbrainz` |
+| `audio_cd` | cd + cdparanoia `audio`; `RIPPER_AUDIO_DRIVE_OFFSETS=sr0=6` | `cyanrip -s 6 -d <dev> -o flac,mp3 -D … -T simple` run in the staging dir; `CD/Artist - Album/FLAC/01 - Song 1.flac` and `…/MP3/01 - Song 1.mp3`; job `succeeded` |
+| `audio_cd_retry` | as above, `cyanrip.1.exit=1`, no offsets | both calls have `-s 0`; the second adds `-N`; job `succeeded`; WARN `cyanrip retry without musicbrainz` |
+| `removed_while_queued` | two drives, `RIPPER_MAX_PARALLEL_JOBS=1`; sr1's disc reports empty before sr0 finishes | sr1's job `cancelled`, never started; sr1 `idle` |
 | `data_cd` | cd + cdparanoia `no_audio` | ddrescue with `.iso` + `.map`; `DATA/<label>/<label>.iso` |
 | `iso_only_dvd` | dvd, `RIPPER_ISO_MODE=only` | ddrescue only; no `mkv` call |
 | `cancel_mid_rip` | bluray + `makemkvcon.block` | cancel while blocked; `Run` returns nil; no `BluRay/MOVIE`, no `.staging/<ts>-sr0`; no eject; job `cancelled`; Stopped notification |
@@ -106,12 +118,13 @@ Typical setups:
 | `discovery` | scan 1: sr0 only; scan 2: sr0 + sr1; scan 3: sr0 only | `/api/v1/status` lists 1, then 2, then 1 drive; INFO `drive discovered` / `drive removed`; no config needed |
 | `two_drives_parallel` | `two_drives_bd_cd`; `makemkvcon.block` released only after the sr1 `cyanrip` call is recorded | both jobs `running` at once; both `succeeded`; two Success notifications |
 | `max_parallel_1` | as above, `RIPPER_MAX_PARALLEL_JOBS=1` | the sr1 job stays `queued` until sr0 finishes; `ripper_jobs{state="queued"}` was 1 at some point |
-| `health` | default, then remove `cyanrip` from `PATH` | `/livez` 200; `/startupz` 503 before the first scan, then 200; `/readyz` 200; `/healthz` 200, then 503 with `tool:cyanrip` failed |
+| `health` | default, then delete the `cyanrip` symlink in the fakebin dir | `/livez` 200; `/startupz` 503 before the first scan, then 200; `/readyz` 200; `/healthz` 200, then 503 with `tool:cyanrip` failed |
 
 **Observability assertions in every scenario:**
 - `GET <admin>/metrics` contains `ripper_jobs_completed_total` with the scenario's `kind` and `state`;
-- every record in the log ring parses as JSON with `time`, `level`, `msg`, `service`, and its `msg`
-  is in the C§6.3 catalogue;
+- every record in the log ring parses as JSON with `time`, `level`, `msg` and `service`;
+- every record that carries a `drive`, `job_id`, `tool` or `check` attribute has a `msg` in the C§6.3
+  catalogue. Records whose `msg` starts with `lifecycle: ` or `otel` come from the kit and are ignored;
 - no record contains the test key `T-test…` or an apprise URL;
 - with an in-memory span exporter (via the telemetry test option), one `engine.job` span exists per
   job, with `tool.run` children.

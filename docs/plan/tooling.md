@@ -87,7 +87,9 @@ tasks:
     dir: web
     sources: [src/**/*, index.html, vite.config.ts, package-lock.json]
     generates: [../internal/webui/dist/index.html]
-    cmds: [npm run build]
+    cmds:
+      - npm run build
+      - touch ../internal/webui/dist/.gitkeep   # emptyOutDir deletes it; go:embed needs the dir in git
 
   scalar:vendor:
     desc: Download, verify and vendor the Scalar bundle
@@ -222,7 +224,7 @@ Workflow hygiene (OpenSSF/Scorecard practices):
   `amannn/action-semantic-pull-request` in `ci.yml` validates PR titles.
 - Plan tasks: `<type>(<package>): <summary> (P<phase>.<n>)`, e.g.
   `feat(disc): parse makemkv DRV lines (P1.2)`.
-- The conversion's user-visible breaks (main plan §8) land in the phase 5 PR as `feat!:` with a
+- The conversion's user-visible breaks (main plan §8) land in the phase 4 cutover PR (P4.3) as `feat!:` with a
   `BREAKING CHANGE:` footer pointing to the migration notes.
 
 ## 5. Releases — release-please
@@ -251,7 +253,7 @@ tags `vX.Y.Z`, writes `CHANGELOG.md` and creates a GitHub Release.
 ```
 
 `.release-please-manifest.json`: `{ ".": "0.0.0" }`. The first release is `0.1.0`; `1.0.0` is cut
-by hand (`Release-As: 1.0.0` footer) once phase 5 ships.
+by hand (`Release-As: 1.0.0` footer) once phase 4 ships.
 
 **Token.** Tags and PRs created with the default `GITHUB_TOKEN` don't trigger other
 workflows, so CI wouldn't run on the release PR. Use a **GitHub App** token
@@ -329,6 +331,8 @@ auto-merged. This replaces the old forum-polling and base-image-polling workflow
     }
   ],
   "packageRules": [
+    { "matchDepNames": ["FFmpeg/FFmpeg"], "extractVersion": "^n(?<version>.+)$", "semanticCommitType": "fix", "automerge": false },
+    { "matchDepNames": ["cyanreg/cyanrip"], "versioning": "loose" },
     { "matchDepNames": ["makemkv"], "extractVersion": "makemkv-bin-(?<version>[\\d.]+)\\.tar\\.gz", "semanticCommitType": "fix", "automerge": true },
     { "matchFileNames": ["Dockerfile"], "matchDepNames": ["debian", "gcr.io/distroless/cc-debian13", "cyanreg/cyanrip"], "semanticCommitType": "fix", "automerge": true },
     { "matchManagers": ["npm"], "matchFileNames": ["web/**"], "groupName": "web" },
@@ -349,7 +353,7 @@ documented in the PR template.)
 
 | File | Triggers | Jobs |
 |---|---|---|
-| `ci.yml` | pull_request, push main | `pr-title` (PRs only), `go` (`task lint test vuln`; includes the e2e smoke), `ui` (`task ui:lint ui:test ui:build` + `git diff --exit-code web/src/api/schema.d.ts`), `image` (build both images + Trivy; no push) |
+| `ci.yml` | pull_request, push main | `pr-title` (PRs only), `go` (`task lint test vuln`; includes the e2e smoke), `ui` (`task ui:lint ui:test ui:build` + `git diff --exit-code web/src/api/schema.d.ts`), `image` (build the image for amd64 + Trivy + smoke tests; no push) |
 | `security.yml` | pull_request, push main, weekly | CodeQL (go, javascript-typescript), OSV-Scanner, Scorecard (push/weekly only) |
 | `release.yml` | push main | release-please → publish on release (native amd64 + arm64 builds, manifest merge) |
 

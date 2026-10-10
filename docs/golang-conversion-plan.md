@@ -42,7 +42,7 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
 |---|---|---|
 | 1 | Seam / Patchbay | One interface per capability (5 seams: runner, detect, rip, eject, notify). Backends are separate packages, single shared instances. `internal/patchbay` is the only place that selects them. |
 | 2 | Entrypoint | `cmd/ripper/main.go` → `internal/cli` (cobra). Follows [go.dev module layout](https://go.dev/doc/modules/layout). |
-| 3 | Config | **viper only**, confined to `internal/cli`. A clean `RIPPER_*` set of 21 keys (C§1); no legacy names. |
+| 3 | Config | **viper only**, confined to `internal/cli`. A clean `RIPPER_*` set of 22 keys (C§1); no legacy names. |
 | 4 | Service framework | go-service-kit v0.3.0: `lifecycle`, `obs`, `httpapi`, `outbound`. |
 | 5 | Modes | `ripper serve` = engine + API + docs, plus the web UI unless `--headless`. |
 | 6 | Ports | API, UI and docs on `:9090`; admin (`/healthz`, `/readyz`, `/metrics`) on `:9091`. |
@@ -63,7 +63,7 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
 | 21 | Quality gates | golangci-lint v2.14, govulncheck, OSV-Scanner, CodeQL, Trivy, OpenSSF Scorecard; SHA-pinned actions; signed images with SBOM + provenance (L§2–3). |
 | 22 | Releases | release-please (manifest, release type `go`, Conventional Commits, GitHub App token). Images publish from the release workflow. |
 | 23 | Verification | A behaviour spec plus Go tests (unit, fakebin integration, end-to-end smoke). **No legacy parity harness.** Hardware acceptance at cutover. |
-| 24 | Bad drive replies | After 5 in a row `/readyz` fails and one Failure notification is sent. No eject, no exit; the engine keeps polling. |
+| 24 | Bad drive replies | After 5 in a row a drive becomes `unusable` and one Failure notification is sent; `/readyz` fails only when **no** usable drive is left. No eject, no exit; polling continues and the drive recovers by itself. |
 | 25 | Re-rip protection | After any rip attempt the engine waits for the disc to be removed. It never re-rips the same disc. |
 | 26 | Staging | Every rip goes into `<kind>/.staging/…` and is renamed into place on success; staging is cleaned at start. |
 | 27 | Native ioctl backends | Future note only (phases.md "Future"). |
@@ -112,7 +112,8 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
 - Do not import viper or cobra outside `internal/cli`.
 - Do not use the package-level viper instance, and do not call `v.AutomaticEnv()`.
 - Do not keep package-level mutable state.
-- Do not use `http.StripPrefix`, or anything else that clones the request, as listener middleware.
+- Do not use `http.StripPrefix`, or anything else that clones the request, as listener-wide middleware
+  (per-route `StripPrefix` after the mux has matched is fine).
 - Do not use `cmd.StdoutPipe` with `cmd.Run`/`Wait`.
 - Do not log argv, the MakeMKV key, apprise URLs or the web password. Do not use a `msg` that isn't in the C§6.3 catalogue.
 - Do not use disc labels, paths or errors as metric labels.
@@ -128,7 +129,7 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
 | Principle | Concretely |
 |---|---|
 | KISS | One binary, one engine loop, one output root, one log stream, a UI with no router. |
-| YAGNI | 21 config keys; no backend switches; no parity harness; no log file; native ioctl deferred. |
+| YAGNI | 22 config keys; no backend switches; no parity harness; no log file; native ioctl deferred. |
 | DRY | One `rip.Ripper` interface and one staging/finalize path for every kind; TS types generated from the Go types; CI calls the tasks. |
 | SOLID | 5 small seams; substitutable backends; new backend = new package + one patchbay line; the engine depends only on seams; patchbay split into `Backends` and `Spec`. |
 | 12-Factor | Env config (+ one flag); logs to stdout; port binding via env; kit `lifecycle` for disposability; admin one-offs (`detect`, `healthcheck`). |
@@ -151,10 +152,11 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
   - `PropagationDelay: NoPropagationDelay`;
   - `DrainTimeout: 5s`;
   - `FlushTimeout`: the default, 5s;
-  - engine `StopTimeout: 15s`. The kit cancels the context immediately; 15 s is the cleanup budget.
+  - engine `StopTimeout: 15s`. The kit cancels the context immediately; 15 s is the cleanup budget per
+    running job: process-group kill ≤ 5 s + staging cleanup ≤ 5 s + "stopped" notification ≤ 3 s.
   
-  Total grace = 5 + 5 + 15 + 5 margin = **30 s**. Use compose `stop_grace_period: 30s` and
-  k8s `terminationGracePeriodSeconds: 30`.
+  `Spec.GracePeriod()` = 5 + 5 + 15 + 5 margin = **30 s**; the container's grace must exceed it, so use
+  compose `stop_grace_period: 35s` and k8s `terminationGracePeriodSeconds: 35`.
 - **Probes** (all on 9091, schemas in C§6.1): Docker `HEALTHCHECK CMD ["ripper","healthcheck"]` checks `/healthz` (dependencies).
   - k8s `startupProbe`: `/startupz`; `livenessProbe`: `/livez` (process only, so a broken dependency
     never causes a restart loop);
@@ -174,6 +176,12 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
 | viper | v1.21.0 | |
 | go-service-kit | v0.3.0 | |
 | apprise-go | v0.3.3 (exact) | pre-1.0 |
+| huma | `github.com/danielgtaylor/huma/v2` v2.39.0 | the kit's version; used directly in `internal/api` |
+| Prometheus client | `github.com/prometheus/client_golang` v1.24.1 | the kit's version; `*prometheus.Registry` in `internal/health` |
+| OTel API | `go.opentelemetry.io/otel`, `/trace`, `/metric`, `/attribute`, `/codes` v1.45.0 | the kit's version; API only outside `internal/telemetry` |
+| OTel SDK (tests and `internal/telemetry` only) | `go.opentelemetry.io/otel/sdk`, `/sdk/metric` v1.45.0 | in-memory exporter/reader in tests |
+
+Go modules other than these need an entry here first.
 
 Two trade-offs are accepted:
 - apprise-go's `Send` has no context and uses its own HTTP client, so it bypasses kit `outbound`.
@@ -213,7 +221,7 @@ Two trade-offs are accepted:
 | `PREFIX` / `USER` / `PASS` | `RIPPER_WEB_PATH_PREFIX` / `RIPPER_WEB_USERNAME` / `RIPPER_WEB_PASSWORD` |
 | `DEBUG`, `DEBUGTOWEB` | `RIPPER_LOG_LEVEL` |
 | `TIMESTAMPPREFIX`, `SEPARATERAWFINISH`, `BAD_THRESHOLD` | removed |
-| `/config/abcde.conf` | removed; use `RIPPER_AUDIO_FORMATS` |
+| `/config/abcde.conf` | removed; use `RIPPER_AUDIO_FORMATS` and `RIPPER_AUDIO_DRIVE_OFFSETS` |
 
 **Removed features**
 - `/config/ripper.sh` and the hook scripts (`BLURAYrip.sh`, `DVDrip.sh`, `CDrip.sh`, `DATArip.sh`).
@@ -233,7 +241,8 @@ Two trade-offs are accepted:
 4. After any rip attempt the engine waits for the disc to be removed: no re-rip loops.
 5. Rips are staged and renamed into place. Partial output is removed on failure, on shutdown, and
    at the next start after a crash.
-6. `ddrescue` writes a `.map` file next to the `.iso`, so an interrupted ISO rip can resume.
+6. `ddrescue` keeps its `.map` file next to the finished `.iso` (a record of any unreadable areas).
+   An interrupted ISO rip is discarded with its staging dir and restarts from scratch.
 7. The ripper is the only thing that ejects (abcde used to eject CDs itself). `RIPPER_EJECT=false` is
    now honoured for CDs.
 8. **Audio CDs are ripped with cyanrip instead of abcde**: AccurateRip-verified, MusicBrainz tags and
@@ -270,8 +279,15 @@ Two trade-offs are accepted:
 - **apprise-go** is pre-1.0. It sits behind the `Notifier` seam; re-evaluate in phase 2.
 - **OTLP logs/metrics** are not exported yet (traces only, as in go-service-kit); adding them is a
   one-package change (C§6.5).
-- **cyanrip's MusicBrainz-miss behaviour** is assumed to be a non-zero exit (the retry rule); checked in P2.3b.
-- **The ffmpeg component list** for cyanrip is checked with `cyanrip -o help` (P4.1) and real rips (P4.5).
+- **cyanrip**: the retry rule is verified in cyanrip's source (a MusicBrainz miss exits 1 before ripping);
+  P2.3b confirms it on hardware. `-s` (drive offset) is mandatory; without your drive's real offset
+  (`RIPPER_AUDIO_DRIVE_OFFSETS`), AccurateRip can report mismatches.
+- **Unverified in this environment:** that Debian's `tini` ships `/usr/bin/tini-static` (fallback in P4.1);
+  that `makemkv-bin` has an arm64 binary (P4.1 stops and asks); that `makemkv-oss` builds against
+  FFmpeg 8.1; the AntD 6 `ConfigProvider csp` prop (P3.5's test catches it); the action major versions.
+- **Scanning during a rip**: `makemkvcon info` runs every tick while other drives rip; checked at P4.5.
+- **The ffmpeg component list** was derived from cyanrip's source; it is checked with `cyanrip -o help` (P4.1)
+  and real rips including AAC, ReplayGain and cover art (P4.5).
 - **Concurrent MakeMKV instances** (multi-drive) are assumed to work; this is checked at P4.5 with two drives if available.
 - **`makemkvcon reg`** is assumed to write `app_Key` itself; this is checked at P4.5.
 - **DVD/BD data discs** are treated as video until a hardware capture shows a distinguishing signal.

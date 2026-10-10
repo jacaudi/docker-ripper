@@ -31,9 +31,12 @@ Pinned versions (Renovate keeps them current afterwards):
 | react / react-dom | 19.3.0 |
 | antd | 6.6.5 |
 | vite / @vitejs/plugin-react | 8.3.4 / 6.1.2 |
-| vitest / @testing-library/react / jsdom | 5.0.3 / 16.3.3 / latest compatible |
-| typescript | 5.9.x (**not 7.x**: openapi-typescript and typescript-eslint need 5.x) |
-| eslint / typescript-eslint / eslint-plugin-react-hooks / prettier | 10.12.0 / latest compatible |
+| vitest / @testing-library/react / @testing-library/dom / @testing-library/jest-dom / jsdom | 5.0.3 / 16.3.3 / ^10 / latest 6.x / 30.1.2 |
+| @types/react / @types/react-dom | 19.x |
+| typescript | **5.9.3** (not 6.x/7.x: openapi-typescript needs `^5`, typescript-eslint 8.71 needs `<6.1`) |
+| eslint / typescript-eslint / eslint-plugin-react-hooks / prettier | 10.12.0 / 8.71.1 / 7.1.1 / 3.9.9 |
+| FFmpeg (static, in the image) | n8.1.3 (the 9.x major is a separate Renovate PR: check MakeMKV builds against it) |
+| cyanrip | v0.9.3.1 |
 | openapi-typescript / openapi-fetch | 7.13.0 / 0.17.0 |
 | @scalar/api-reference | 1.73.1 |
 | GitHub Actions | current major, pinned by commit SHA (L§3) |
@@ -50,13 +53,17 @@ Pinned versions (Renovate keeps them current afterwards):
     Delete any `Makefile`.
   - `.gitignore`: `internal/webui/dist/*`, `!internal/webui/dist/.gitkeep`, `web/node_modules/`, `bin/`.
   - `.dockerignore`: `web/node_modules`, `bin`. Do **not** ignore `.git` (C§5.7).
-- Done when: `task tools && task lint test vuln` exits 0, and `bin/golangci-lint version` prints `built with go1.27`.
+- Done when: `task tools` exits 0 and `bin/golangci-lint version` prints `built with go1.27`.
+  (`task lint test vuln` need at least one Go package; they become the done-criterion from P1.4.)
+- Dependencies: add each module with `go get <module>@<version>` (versions in the table above) in the
+  task that first imports it, never earlier.
 
 **P0.2 Releases and commit conventions**
 - Files: `release-please-config.json`, `.release-please-manifest.json`, `.github/workflows/release.yml`
   (the `release-please` job only), `.github/pull_request_template.md` (checklist: conventional title,
   `task lint test vuln` run (`task check` once `web/` exists), migration note if user-visible).
-- Do: L§4, L§5.
+- Do: L§4, L§5. The `release-please` job needs `permissions: contents: write, pull-requests: write`
+  at job level (top level stays `contents: read`).
 - **(owner):** create the GitHub App and its secrets; set squash-only merging; allow Actions to
   create PRs (main plan §9).
 - Done when: after merge, release-please opens a release PR.
@@ -64,7 +71,10 @@ Pinned versions (Renovate keeps them current afterwards):
 **P0.3 fakebin**
 - Files: `internal/testutil/fakebin/main.go`, `internal/testutil/fakebin/fakebin_test.go`,
   `internal/testutil/fakebintest/fakebintest.go`.
-- Do: implement T§3 exactly.
+- Do: implement T§3 exactly (including `pid` in `calls.jsonl`).
+- Optional simpler variant (pick one and note it in the PR): instead of `go build`, re-exec the test
+  binary itself: `TestMain` runs fakebin's `main` when `os.Getenv("FAKEBIN") == "1"`, and `Install`
+  symlinks `os.Args[0]` under each tool name.
 - Test: one case per protocol row (per-call stdout/stderr/exit, each `creates` template, block/release,
   SIGTERM → 143 without creates).
 - Done when: `go test ./internal/testutil/...` passes.
@@ -83,20 +93,21 @@ Pinned versions (Renovate keeps them current afterwards):
 ## Phase 1 — Core
 
 **P1.1 `internal/disc`**
-- Do: types from C§2.1, including `String` and `MarshalText`.
-- Test: the string of every value.
+- Do: types from C§2.1, including `String`, `MarshalText`, `UnmarshalText` and `DriveID`.
+- Test: the string of every value; `json.Marshal` → `json.Unmarshal` round-trips every value; an unknown string → error.
 - Done when: `go test ./internal/disc` passes.
 
 **P1.2 `internal/config`**
-- Files: `config.go` (struct with every field from C§1.2), `validate.go`, `prefix.go` (`NormalizePrefix`), tests.
+- Files: `config.go` (struct with every field from C§1.2, plus `UmaskMode()` and `AudioOffsets()`), `validate.go`, `prefix.go` (`NormalizePrefix`), tests.
 - Test: one row per validation rule in C§1.2; the prefix examples from C§1.3; a fully valid config
-  gives no error; three bad values give one error that mentions all three.
+  gives no error; three bad values give one error that mentions all three env names;
+  `RIPPER_AUDIO_DRIVE_OFFSETS=sr0=6,sr1=-667` → `{sr0:6, sr1:-667}`; `sr0=x` or a duplicate drive → error.
 - Done when: `go test ./internal/config` passes.
 
 **P1.3 `internal/cli`: root, viper, version**
 - Files: `cli.go` (`Execute(ctx) int`, C§5.3), `root.go`, `load.go`
-  (`load(cmd *cobra.Command) (config.Config, error)`, C§1.1), `version.go` (C§5.7 plus the `version`
-  command), `load_test.go`.
+  (`load(cmd *cobra.Command) (config.Config, error)`, C§1.1, with the one key table), `version.go` (C§5.7;
+  the `version` command prints `version()` and a newline, exit 0), `load_test.go`.
 - Test (use `t.Setenv`):
   - defaults;
   - each `RIPPER_*` maps to its field;
@@ -112,21 +123,21 @@ Pinned versions (Renovate keeps them current afterwards):
 
 **P1.4 `cmd/ripper/main.go`**
 - Do: `func main() { os.Exit(cli.Execute(context.Background())) }`.
-- Done when: `go build ./cmd/ripper && ./ripper version` prints a version.
+- Done when: `go build ./cmd/ripper && ./ripper version` prints a version, and `task lint test vuln` passes.
 
 **P1.5 `internal/output`**
-- Files: `planner.go` (C§3.5), `perm.go` (C§5.4), tests.
+- Files: `planner.go` (C§3.5), `perm.go` (C§5.4: `fs.WalkDir(p.root.FS(), rel, …)` + `p.root.Chmod`), tests.
 - Test:
   - sanitise: `"Movie: Part 1/2"` → `"Movie_ Part 1_2"`; `".."` and `""` → `disc_<ts>`;
-  - Prepare path shape;
+  - Prepare path shape (`<kindDir>/.staging/20060102_150405-<drive>/<sanitised label>`);
   - Finalize rename;
   - collision → `_<ts>`; a second collision → error;
-  - CD multi-child move, with `.wav` excluded;
   - Cleanup;
   - CleanStaging;
   - modes for umask `002` and `022`: dirs, plain files, executable files;
   - chown is skipped when UID and GID are −1;
-  - a label of `../../etc` stays inside the root.
+  - a label of `../../etc` stays inside the root;
+  - `CheckWritable` succeeds twice concurrently.
 - Done when: `task lint test` passes.
 
 **P1.6 `internal/logring`**
@@ -142,8 +153,8 @@ Pinned versions (Renovate keeps them current afterwards):
 
 **P2.0 `internal/telemetry`**
 - Do: C§6.5. It is the only package that imports `obs`.
-- Test: `Setup` with an in-memory span exporter returns a working Logger, Tracer and Meter; a log
-  record reaches both stdout (captured writer) and the ring; `Shutdown` is idempotent.
+- Test: `Setup` with `Config{Output: &buf, SpanExporter: tracetest.NewInMemoryExporter()}` returns a
+  working Logger, Tracer and Meter; a log record reaches both `buf` and the ring; `Shutdown` is idempotent.
 
 **P2.1 `internal/runner` + `execrunner`**
 - Do: C§2.2, C§5.1, plus its metrics (C§6.2) and `tool.run` span (C§6.4).
@@ -152,8 +163,11 @@ Pinned versions (Renovate keeps them current afterwards):
   - argv never appears in any log record;
   - `Cmd.Dir` is honoured (fakebin records `dir`);
   - exit code → `ExitError` via `errors.AsType`;
-  - cancelling during `.block` returns within 6 s, and `syscall.Kill(-pgid, 0)` returns `ESRCH` afterwards;
+  - cancelling during `.block` returns within 6 s, and `syscall.Kill(-call.PID, 0)` returns `ESRCH` afterwards
+    (the fake is the process-group leader, so its pid is the pgid);
   - `Output` is capped at 1 MiB;
+  - `PRGV:`/`PRGC:`/`PRGT:` lines are not logged; other lines are;
+  - `tool finished` / `tool failed` records carry `duration_ms` / `exit_code`;
   - `ripper_tool_runs_total` has the right `result` (in-memory metric reader);
   - a `tool.run` span exists (in-memory span exporter).
 
@@ -161,11 +175,13 @@ Pinned versions (Renovate keeps them current afterwards):
 - Do: `ParseDRV` (C§3.1, all drives) and the `Detector` (C§3.2).
 - Test: the T§2 expectation table; detector cases with fakebin: timeout (`.block` with a 1 s
   constructor timeout), the cdparanoia `audio`/`no_audio` paths per device
-  (`cdparanoia.sr1.stdout`), makemkvcon exit 1, and `no_drives`.
+  (`cdparanoia.sr1.stdout`), a device in `busy` is not probed, makemkvcon exit 1, `no_drives`, `garbage`, `bad_state`.
 
 **P2.3 Rip backends**
 - Files: `rip/makemkv` (embed `default.mmcp.xml`, moved from `root/ripper/`), `rip/ddrescue`, `rip/cyanrip`.
-- Do: argv exactly as in C§3.6, including the profile resolution and the cyanrip retry and folder rule.
+- Do: argv exactly as in C§3.6, including the profile resolution and the cyanrip `-s`/`-D`/`-T` flags,
+  retry and folder rule. The embedded profile is written by `makemkv.New` to `os.MkdirTemp("", "ripper-")`
+  as `default.mmcp.xml` (mode 0o600) and left for the process lifetime (no Close).
   makemkv and ddrescue return `name == ""`; cyanrip returns the album folder name.
 - Test (fakebin):
   - `calls.jsonl` argv and `dir`;
@@ -183,7 +199,9 @@ Pinned versions (Renovate keeps them current afterwards):
 **P2.4 `eject/execeject`**
 - Do: the C§3.6 sequence, with `device` as an argument. Inject waits as
   `sleep func(context.Context, time.Duration) error`.
-- Test: success; `eject.exit=1` → sdparm unlock, then eject; the last error is returned.
+- Test matrix: success → one `eject` call, `nil`; `eject.exit=1` and sdparm ok → calls `eject`,
+  `sdparm --command=unlock`, `sdparm --command=eject`, result `nil`; `eject.exit=1` + `sdparm.2.exit=1`
+  → an error wrapping `*runner.ExitError{Tool: "sdparm"}`.
 
 **P2.5 `notify/apprise` + `notify/nop`**
 - Do: C§5.2 (with the mutex), C§3.7.
@@ -191,12 +209,14 @@ Pinned versions (Renovate keeps them current afterwards):
   `context.DeadlineExceeded`; an invalid URL fails `New`; 10 concurrent `Notify` calls are serialised (race-free).
 
 **P2.6 `internal/makemkvkey`**
-- Do: C§5.5 (`FetchBetaKey`) and `Register` (C§3.6).
+- Do: C§5.5 (`FetchBetaKey`), `Register` (C§3.6, via `Output`, output discarded) and `RegistrationResult` (C§2.3).
 - Test: an httptest page with a key → the key; a page without → error; 500 → error.
   `Register` runs `makemkvcon reg <key>` via fakebin, and the key appears in no log record.
 
 **P2.7 `internal/engine`**
-- Do: C§2.4, C§3.3, C§3.4, plus `metrics.go` (C§6.2), the spans (C§6.4) and the log messages (C§6.3).
+- Files: `engine.go`, `scan.go`, `job.go`, `metrics.go`, `enginetest/fakes.go` (T§1), tests.
+- Do: C§2.4, C§3.3 (**follow the concurrency rules exactly**), C§3.4, plus metrics (C§6.2), spans (C§6.4)
+  and the log messages at the points C§3.3 names (C§6.3).
 - Tests (all under synctest, fakes per T§1):
   - every cell of C§3.4;
   - discovery: drives appear and disappear; a drive with a running job is not removed;
@@ -211,7 +231,9 @@ Pinned versions (Renovate keeps them current afterwards):
     (`queued`) and starts after the first finishes; FIFO order across three drives;
   - cancel: a running job → Cleanup, Stopped notification via the detached ctx, no eject; queued jobs
     → `cancelled`; `Run` returns nil after the workers finish;
-  - `Jobs()` ordering and the history cap (51 jobs → 50 kept);
+  - `Jobs()` ordering and the history cap (51 jobs → 50 kept); job IDs unique under a fixed clock (seq);
+  - a queued job whose disc is removed → `cancelled`, never started;
+  - `DriveStatus.Job` shows the current job, then the last finished one;
   - `Started`, `CheckLoop` and `CheckDrives` semantics;
   - metrics (in-memory reader) and spans (in-memory exporter).
 
@@ -222,7 +244,8 @@ Pinned versions (Renovate keeps them current afterwards):
   - `health`:
     - `NewAdminServer` and the three Readiness instances, with exactly the checks in C§6.1;
     - `type Handlers struct{ Startup, Health, Ready *httpapi.Readiness; Registry *prometheus.Registry }`;
-    - `func Checks(cfg config.Config, eng *engine.Engine, planner *output.Planner, reg *RegistrationResult, startup *atomic.Bool) Handlers`.
+    - `func Checks(cfg config.Config, eng *engine.Engine, planner *output.Planner, reg *makemkvkey.RegistrationResult, startup *atomic.Bool) Handlers`.
+  - `serve` builds the runner with `execrunner.New(tel.Logger, tel.Tracer, tel.Meter)` and passes it on.
   - `func Backends(cfg config.Config, run runner.Runner, tel *telemetry.Telemetry, planner *output.Planner) (engine.Deps, error)`:
     one instance of each backend (C§2.3); `notify/nop` when `AppriseURLs` is empty; `engine.NewMetrics(tel.Meter)`.
   - `func Spec(cfg config.Config, eng *engine.Engine, tel *telemetry.Telemetry, h health.Handlers, ring *logring.Ring) (lifecycle.Spec, error)`:
@@ -259,6 +282,8 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
   `type EngineView interface{ Drives() []engine.DriveStatus; Jobs() []engine.Job }` and
   `type LogSource interface{ Lines(n int) []string }`),
   `auth.go` (C§4.3), tests, `testdata/openapi.json` (golden).
+- The log input is ``struct{ Lines int `query:"lines" default:"200" minimum:"1" maximum:"2000"` }``.
+- Golden update flag: `var update = flag.Bool("update", false, "rewrite testdata/openapi.json")`.
 - Test (`humatest`):
   - status 200 with one entry per drive (sorted by ID) and the queued/running counts;
   - jobs 200 in `engine.Jobs()` order;
@@ -270,11 +295,12 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 - Files: `scripts/vendor-scalar.sh`, `internal/apidocs/assets/{docs.html,docs-init.js,standalone.js,SHA256}`, `apidocs.go`, tests.
 - `vendor-scalar.sh <version>`:
   - download `https://registry.npmjs.org/@scalar/api-reference/-/api-reference-<version>.tgz`;
-  - verify its sha512 against `dist.integrity` from `https://registry.npmjs.org/@scalar/api-reference/<version>`;
+  - verify its sha512 against `dist.integrity` from `https://registry.npmjs.org/@scalar/api-reference/<version>`
+    (`curl … | jq -r .dist.integrity`, strip `sha512-`, `base64 -d | xxd -p -c 256`, compare with `sha512sum`);
   - extract `package/dist/browser/standalone.js`;
   - write the file's sha256 to `SHA256`.
 - `Mount(api *httpapi.API, prefix string)` registers the docs and OpenAPI routes from C§4.1, with
-  the CSP from C§4.4.
+  the CSP from C§4.4 (`docs-init.js` exactly as in C§4.4, including `proxyUrl: ''`).
 - Test: `/docs` 200 with the exact CSP; an asset 200; `/openapi.json` 200 with valid JSON;
   `standalone.js` matches `SHA256`.
 
@@ -307,7 +333,8 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 - `components/JobsTable.tsx`: AntD `Table` (`size="small"`, `pagination={{ pageSize: 10 }}`); columns
   job ID, drive, kind, label, state (`Tag`: queued `default`, running `processing`, succeeded `success`,
   failed `error`, cancelled `warning`, skipped `default`), queued/started/finished, paths, error.
-- `components/StatusCard.tsx` (props: one `Status`; no fetching of its own):
+- `components/StatusCard.tsx` (props: one `components["schemas"]["DriveStatus"]`; no fetching of its own;
+  the job fields come from `status.job`):
   - title = drive ID and device;
   - AntD `Card` + `Descriptions`: state, disc kind, label, device, started at + live elapsed,
     bad responses, last result (outcome, error, paths);
@@ -328,7 +355,8 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 - Done when: `task ui:lint ui:test ui:build` passes and `internal/webui/dist/index.html` exists.
 
 **P3.5 `internal/webui`**
-- Files: `webui.go` (`//go:embed all:dist`; `Mount(api *httpapi.API, prefix string) error`), tests.
+- Files: `webui.go` (`//go:embed all:dist`; `uiAssets, _ = fs.Sub(dist, "dist/assets")`; favicon from
+  `dist/favicon.ico`; `Mount(api *httpapi.API, prefix string) error`), tests.
 - Do: the C§4.1 routes marked "!headless", with the CSP + nonce from C§4.4. `Mount` returns an
   error when `dist/index.html` is missing, so `serve` without `--headless` fails loudly.
 - Test:
@@ -340,7 +368,9 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 **P3.6 Wire HTTP into the patchbay**
 - Do: in `Spec`, build the API listener with `httpapi.New` (C§4.1 options) and call `api.Register`
   (EngineView = engine, LogSource = ring) and `apidocs.Mount`; call `webui.Mount` unless headless;
-  add the root redirects. Add the API server to `Servers`.
+  add the root redirects (`http.Redirect(w, r, P+"/", http.StatusMovedPermanently)` for `GET P`;
+  `http.Redirect(w, r, P+"/"` or `P+"/docs", http.StatusFound)` for `GET /{$}`). Add the API server to `Servers`.
+  Per-route `http.StripPrefix` (after the mux matched) is fine; only listener-wide StripPrefix is forbidden.
 - Test: hit every route in both modes.
 
 **P3.7 End-to-end smoke**
@@ -358,14 +388,14 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 # syntax=docker/dockerfile:1
 ARG DEBIAN=trixie-YYYYMMDD-slim     # renovate: datasource=docker depName=debian versioning=regex:^trixie-(?<major>\d{8})-slim$
 ARG MAKEMKV_VERSION=X.Y.Z           # renovate: datasource=custom.makemkv depName=makemkv
-ARG CYANRIP_VERSION=vX.Y.Z          # renovate: datasource=github-tags depName=cyanreg/cyanrip
+ARG CYANRIP_VERSION=v0.9.3.1        # renovate: datasource=github-tags depName=cyanreg/cyanrip
+ARG FFMPEG_VERSION=8.1.3            # renovate: datasource=github-tags depName=FFmpeg/FFmpeg
 
 FROM node:24-alpine AS ui
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
-COPY internal/api/testdata/openapi.json /src/internal/api/testdata/openapi.json
 RUN npm run build
 
 FROM golang:1.27 AS go
@@ -379,14 +409,15 @@ RUN CGO_ENABLED=0 go build -trimpath -o /ripper ./cmd/ripper
 FROM debian:${DEBIAN} AS media
 ARG MAKEMKV_VERSION
 ARG CYANRIP_VERSION
+ARG FFMPEG_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential pkg-config wget git ca-certificates gnupg dirmngr nasm meson ninja-build \
+      build-essential pkg-config wget git xz-utils ca-certificates gnupg dirmngr nasm meson ninja-build \
       libexpat1-dev libssl-dev zlib1g-dev libmp3lame-dev libopus-dev \
       libcdio-paranoia-dev libmusicbrainz5-dev libcurl4-openssl-dev \
       cdparanoia gddrescue eject sdparm tini \
  && rm -rf /var/lib/apt/lists/*
 COPY scripts/build-media.sh /build.sh
-RUN /build.sh "${MAKEMKV_VERSION}" "${CYANRIP_VERSION}"
+RUN /build.sh "${FFMPEG_VERSION}" "${MAKEMKV_VERSION}" "${CYANRIP_VERSION}"
 # collect from this stage: it already has every runtime library the binaries link against
 COPY scripts/collect-rootfs.sh /collect.sh
 RUN /collect.sh /rootfs /usr/bin/cdparanoia /usr/bin/ddrescue /usr/bin/eject /usr/bin/sdparm \
@@ -402,26 +433,45 @@ HEALTHCHECK --interval=30s --timeout=3s CMD ["ripper","healthcheck"]
 ENTRYPOINT ["/usr/bin/tini-static","--","/usr/local/bin/ripper"]
 CMD ["serve"]
 ```
-- `scripts/build-media.sh <makemkv-version> <cyanrip-version>` (bash, `set -euo pipefail`; builder only):
-  1. **ffmpeg** (static, shared by both): build into `/opt/ffmpeg` with
-     `--enable-static --disable-shared --disable-programs --disable-doc --disable-everything --disable-network --disable-autodetect --enable-libmp3lame --enable-libopus --enable-parser='*' --enable-decoder='pcm*,flac,aac,ac3,eac3,dca,truehd,mlp,mp2,mp3,vorbis,opus,alac' --enable-encoder='pcm*,flac,libmp3lame,libopus,aac,alac' --enable-muxer='flac,mp3,ogg,opus,ipod,mp4,wav' --enable-filter='aresample,aformat,anull,abuffer,abuffersink,volume,ebur128,replaygain' --enable-protocol=file`.
-     Note: this filter/muxer list is the expected cyanrip set; P4.1's test (`cyanrip -o help`) and
-     P4.5 confirm it, and the list grows if cyanrip needs more.
-  2. **MakeMKV:** download `makemkv-sha-<v>.txt` and verify it with GPG key
-     `2ECF23305F1FC0B32001673394E3083A18042697`; download `makemkv-oss-<v>.tar.gz` and
-     `makemkv-bin-<v>.tar.gz` and check their sha256s.
-     - oss: `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig ./configure --prefix=/usr/local --disable-gui && make && make install`.
+- `scripts/build-media.sh <ffmpeg-version> <makemkv-version> <cyanrip-version>` (bash, `set -euo pipefail`; builder only; every `make` uses `-j"$(nproc)"`):
+  1. **FFmpeg** (static, shared by MakeMKV and cyanrip):
+     - Download `https://ffmpeg.org/releases/ffmpeg-<v>.tar.xz` and `.asc`, and verify the signature
+       with the FFmpeg release signing key. Record its fingerprint in the script, taken from
+       https://ffmpeg.org/download.html#releases; if you can't obtain it, **stop and ask**.
+     - Configure exactly:
+       ```
+       ./configure --prefix=/opt/ffmpeg --enable-static --disable-shared --enable-pic \
+         --disable-programs --disable-doc --disable-everything --disable-network --disable-autodetect \
+         --enable-libmp3lame --enable-libopus --enable-protocol=file --enable-parser='*' \
+         --enable-decoder='pcm*,flac,aac,ac3,eac3,dca,truehd,mlp,mp2,mp3,vorbis,opus,alac,mjpeg,png,webp,bmp' \
+         --enable-encoder='pcm*,flac,libmp3lame,libopus,aac,alac' \
+         --enable-muxer='flac,mp3,ogg,opus,adts,ipod,mp4,wav,image2' --enable-demuxer='image2' \
+         --enable-filter='abuffer,abuffersink,aformat,aresample,anull,anullsink,ebur128,hdcd,aemphasis,volume'
+       make -j"$(nproc)" install
+       ```
+       (`--enable-pic` because `libmakemkv` is a shared object; `anullsink` + `ebur128` for ReplayGain;
+       `hdcd`/`aemphasis` for HDCD and pre-emphasis discs; `image2` + image decoders for cover art.)
+  2. **MakeMKV:**
+     - Download `makemkv-sha-<v>.txt` and verify it with GPG key `2ECF23305F1FC0B32001673394E3083A18042697`.
+     - Download `makemkv-oss-<v>.tar.gz` and `makemkv-bin-<v>.tar.gz`, and check their sha256s.
+     - oss: `PKG_CONFIG="pkg-config --static" PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig ./configure --prefix=/usr/local --disable-gui && make -j"$(nproc)" && make install`.
      - bin: `mkdir -p tmp && touch tmp/eula_accepted && make && make install`.
-  3. **cyanrip:** `git clone --depth 1 --branch <cyanrip-version> https://github.com/cyanreg/cyanrip`,
-     then `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig meson setup build --prefix=/usr/local --buildtype=release && ninja -C build install`.
-  
+     - If the bin tarball has no binary for the build architecture (arm64), **stop and ask**.
+  3. **cyanrip:** `git clone --depth 1 --branch <cyanrip-version> https://github.com/cyanreg/cyanrip`, then
+     `meson setup build --prefix=/usr/local --buildtype=release --prefer-static --pkg-config-path=/opt/ffmpeg/lib/pkgconfig && ninja -C build install`.
+  4. **tini-static:** if `/usr/bin/tini-static` is missing after apt, download
+     `https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-<amd64|arm64>`, check its
+     published sha256, and install it to `/usr/bin/tini-static` (mode 0755).
+
   This replaces `manual-build/install/install.sh` (and fixes its `$version` bug). There is no forum scraping.
 - `scripts/collect-rootfs.sh <out> <binaries...>`:
   - copy each binary, and every `/usr/local/lib/*.so*`, with `cp --parents -L`;
-  - copy the `ldd` closure of all of them (paths after `=>`), excluding the libraries
-    `cc-debian13` already ships (`libc libm libdl libpthread librt libresolv libstdc++ libgcc_s libgomp libssl libcrypto libz libzstd`);
+  - copy the `ldd` closure of all of them (paths after `=>`), excluding only the glibc family and the
+    C++ runtime that `cc-debian13` guarantees (`libc libm libdl libpthread librt libresolv ld-linux* libstdc++ libgcc_s`).
+    Copy everything else, including `libssl`, `libcrypto`, `libz` and `libzstd`, so builder and runtime can't drift;
   - for each Debian package owning a copied file (`dpkg -S`), write `dpkg-query -s <pkg>` to
     `<out>/var/lib/dpkg/status.d/<pkg>`, so image scanners (Trivy) can see them.
+- `.dockerignore`: `web/node_modules`, `bin`, `internal/webui/dist` (built in-image). Not `.git`.
 - **Rule:** the final stage has **no `RUN`**. Every tool ripper execs is an ELF binary copied with its
   library closure. The image has no shell.
 - Test (`task image`):
@@ -456,7 +506,7 @@ CMD ["serve"]
   services:
     ripper:
       image: ghcr.io/jacaudi/docker-ripper:latest
-      stop_grace_period: 30s
+      stop_grace_period: 35s
       restart: unless-stopped
       devices:                       # pass each drive's srN AND its sgN node; all are discovered automatically
         - /dev/sr0:/dev/sr0
@@ -469,7 +519,7 @@ CMD ["serve"]
         RIPPER_APPRISE_URLS: ""
   ```
 - `deploy/k8s/ripper.yaml`: `replicas: 1`, `strategy: Recreate`, device-plugin resources for each
-  drive's sr and sg nodes, `terminationGracePeriodSeconds: 30`, and on port 9091:
+  drive's sr and sg nodes, `terminationGracePeriodSeconds: 35`, and on port 9091:
   - `startupProbe` `/startupz` (`failureThreshold: 30`, `periodSeconds: 5`);
   - `livenessProbe` `/livez`;
   - `readinessProbe` `/readyz`.
@@ -480,8 +530,10 @@ CMD ["serve"]
 **P4.5 Hardware acceptance (owner)**
 - With the built image: one rip each of a DVD, a BluRay (ideally with DTS-HD or TrueHD audio), an
   LPCM DVD, an audio CD and a data CD.
-- For the audio CD, check the tags, the cover and the AccurateRip result in cyanrip's log. Also rip a
-  CD that isn't in MusicBrainz (the retry rule).
+- For the audio CD: set your drive's offset in `RIPPER_AUDIO_DRIVE_OFFSETS` and check the tags, the
+  cover, ReplayGain and the AccurateRip result in cyanrip's log. Rip once with `RIPPER_AUDIO_FORMATS=aac`.
+  Also rip a CD that isn't in MusicBrainz (the retry rule).
+- While one drive rips, confirm the per-tick `makemkvcon info` scan doesn't disturb it.
 - Check that `makemkvcon reg` alone registers the key (`~/.MakeMKV/settings.conf` contains `app_Key`).
   If it doesn't, stop and ask.
 - Cancel one rip with `docker stop` and confirm the partial output is gone.
