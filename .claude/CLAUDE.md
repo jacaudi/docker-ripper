@@ -37,7 +37,7 @@ The pre-conversion state is frozen on the `archive` branch. Do not commit to it.
 
 - **Go 1.27**; one binary `ripper`; entrypoint `cmd/ripper/main.go` → `internal/cli`.
 - **cobra** (`serve [--headless]`, `detect [--raw]`, `healthcheck`, `version`). **viper** is the only
-  config loader and lives only in `internal/cli`. Config is a clean `RIPPER_*` set of 21 keys; the
+  config loader and lives only in `internal/cli`. Config is a clean `RIPPER_*` set of 22 keys; the
   legacy variable names are not supported. Drives are **auto-discovered** (`RIPPER_DRIVES` is only a filter).
 - **go-service-kit** v0.3.0: `lifecycle`, `obs`, `httpapi` (API/UI/docs `:9090`, admin `:9091`), `outbound`.
 - **Seams** (5): runner, detect, rip, eject, notify. `internal/patchbay` selects the backends.
@@ -233,7 +233,7 @@ Fixed paths: `/config` (state, log, overrides), `/out` (rips), `/ripper` (defaul
 - `claude/golang-conversion-plan-*` — the Go conversion plan (`docs/golang-conversion-plan.md`).
 
 Images are published to `ghcr.io/jacaudi/docker-ripper` (decided; workflows still
-point at upstream Docker Hub until phase 5).
+point at upstream Docker Hub until phase 4, P4.3).
 
 ## Working in this repo
 
