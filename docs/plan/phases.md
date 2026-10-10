@@ -161,15 +161,33 @@ Pinned versions (Renovate keeps them current afterwards):
   constructor timeout), the cdparanoia `audio` and `no_audio` paths, and makemkvcon exit 1.
   Scanner: two detectors on the same tick → exactly one `makemkvcon` call; a call after 5 s → a new scan.
 
-**P2.3 Rip backends**
-- Files: `rip/makemkv` (embed `default.mmcp.xml`, moved from `root/ripper/`), `rip/abcde`
-  (embed `abcde.conf`, moved from `root/ripper/`), `rip/ddrescue`.
-- Do: argv exactly as in C§3.6, and the override resolution in C§3.6.
-- Test (fakebin):
-  - `calls.jsonl` argv;
-  - an override file wins over the embedded default;
-  - the abcde per-rip conf contents (base + overrides) are asserted, and the file is deleted afterwards;
-  - ddrescue passes both the `.iso` and the `.map`.
+**P2.3 Video and ISO rip backends**
+- Files: `rip/makemkv` (embed `default.mmcp.xml`, moved from `root/ripper/`), `rip/ddrescue`.
+- Do: argv exactly as in C§3.6, and the profile override resolution. Both return `name == ""`.
+- Test (fakebin): `calls.jsonl` argv; an override file wins over the embedded default; ddrescue
+  passes both the `.iso` and the `.map`.
+
+**P2.3a `internal/cdda`**
+- Do: `TOC`, `ParseTOC`, `MusicBrainzID`, `CDDBID` (C§2.3, C§3.6a). Pure Go, no I/O.
+- Test: the published vectors (T§2) and the `audio` cdparanoia fixture.
+
+**P2.3b `internal/meta` + backends**
+- Do: the seam (C§2.2), `meta/none`, `meta.Fallback` (with the `ripper.meta.lookups` metric), and
+  `meta/musicbrainz` (C§3.6a).
+- Test: the recorded JSON responses via httptest (single artist, Various Artists, 404 → error);
+  Fallback returns Secondary and logs on a Primary error.
+
+**P2.3c `rip/audio`**
+- Do: C§3.6a and the commands in C§3.6.
+- Test (fakebin + a fake `meta.Lookup` + an httptest cover):
+  - argv and tags for both formats;
+  - `RIPPER_AUDIO_FORMATS=flac` → no `lame` call;
+  - the Various layout;
+  - cover present → `--picture`/`--ti`; cover 404 → no cover flags and no failure;
+  - `.wav` removed;
+  - returned name;
+  - cancel during cdparanoia → returns promptly.
+  - Check once, with the real tools on a dev machine, that `lame --ti` and `flac --picture` embed the cover.
 
 **P2.4 `eject/execeject`**
 - Do: the C§3.6 sequence. Inject waits as `sleep func(context.Context, time.Duration) error`.
@@ -204,9 +222,12 @@ Pinned versions (Renovate keeps them current afterwards):
 - Files: `internal/patchbay/backends.go`, `internal/patchbay/spec.go`, `internal/cli/serve.go`,
   `internal/cli/healthcheck.go`.
 - Do:
-  - `func Backends(cfg config.Config, run runner.Runner, p *obs.Providers, planner *output.Planner) ([]engine.Deps, error)`:
+  - `func Backends(cfg config.Config, run runner.Runner, p *obs.Providers, planner *output.Planner, opts Options) ([]engine.Deps, error)`:
     one `Deps` per drive in `cfg.Drives`. Shared across drives: one `Scanner`, the `Planner`, one Notifier
-    (`notify/nop` when `AppriseURLs` is empty), `p.Logger`, `p.Tracer`, and one `engine.NewMetrics(p.Meter)`.
+    (`notify/nop` when `AppriseURLs` is empty), one metadata Lookup, `p.Logger`, `p.Tracer`, and one
+    `engine.NewMetrics(p.Meter)`.
+  - The signature takes a final `opts Options` with `type Options struct{ Meta meta.Lookup }`. This is a
+    test-only seam: nil means `meta.Fallback{musicbrainz.New(client, DefaultBaseURL, DefaultCoverURL), none.Lookup{}}`.
   - `func Spec(cfg config.Config, engines []*engine.Engine, p *obs.Providers, ring *logring.Ring) (lifecycle.Spec, error)`
     with:
     - the admin listener and readiness (C§4.2);
@@ -326,9 +347,14 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 
 ## Phase 4 — Cutover
 
-**P4.1 Dockerfiles** — replace both:
+**P4.1 Dockerfile (one image, distroless)**
+- Files: `Dockerfile` (repo root), `scripts/build-makemkv.sh`, `scripts/collect-rootfs.sh`, `.dockerignore`.
+- `Dockerfile` (fill in the pins; Renovate maintains them, L§6):
 ```dockerfile
 # syntax=docker/dockerfile:1
+ARG DEBIAN=trixie-YYYYMMDD-slim     # renovate: datasource=docker depName=debian versioning=regex:^trixie-(?<major>\d{8})-slim$
+ARG MAKEMKV_VERSION=X.Y.Z           # renovate: datasource=custom.makemkv depName=makemkv
+
 FROM node:24-alpine AS ui
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
@@ -345,30 +371,66 @@ COPY . .
 COPY --from=ui /src/internal/webui/dist internal/webui/dist
 RUN CGO_ENABLED=0 go build -trimpath -o /ripper ./cmd/ripper
 
-FROM ubuntu:noble
-ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 HOME=/root
-# latest/: add ppa:heyarje/makemkv-beta and install makemkv-bin makemkv-oss
-# manual-build/: keep the MakeMKV-from-source stage and copy /usr/local from it
+FROM debian:${DEBIAN} AS makemkv
+ARG MAKEMKV_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      abcde ca-certificates ccextractor cdparanoia eject eyed3 flac gddrescue glyrc id3 id3v2 \
-      lame mkcue sdparm speex tini vorbis-tools vorbisgain \
+      build-essential pkg-config wget ca-certificates gnupg dirmngr nasm \
+      libexpat1-dev libssl-dev zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
+COPY scripts/build-makemkv.sh /build.sh
+RUN /build.sh "${MAKEMKV_VERSION}"
+
+FROM debian:${DEBIAN} AS tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cdparanoia flac lame gddrescue eject sdparm tini libexpat1 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=makemkv /usr/local /usr/local
+COPY scripts/collect-rootfs.sh /collect.sh
+RUN /collect.sh /rootfs /usr/bin/cdparanoia /usr/bin/flac /usr/bin/lame /usr/bin/ddrescue \
+      /usr/bin/eject /usr/bin/sdparm /usr/bin/tini-static /usr/local/bin/makemkvcon
+
+FROM gcr.io/distroless/cc-debian13:latest@sha256:<digest>
+COPY --from=tools /rootfs /
 COPY --from=go /ripper /usr/local/bin/ripper
+ENV HOME=/config LANG=C.UTF-8
+VOLUME ["/config", "/out"]
 EXPOSE 9090 9091
 HEALTHCHECK --interval=30s --timeout=3s CMD ["ripper","healthcheck"]
-ENTRYPOINT ["tini","--","ripper"]
+ENTRYPOINT ["/usr/bin/tini-static","--","/usr/local/bin/ripper"]
 CMD ["serve"]
 ```
+- `scripts/build-makemkv.sh <version>` (bash, `set -euo pipefail`; runs in the builder only):
+  1. Download `makemkv-sha-<v>.txt` and verify it with GPG key `2ECF23305F1FC0B32001673394E3083A18042697`.
+  2. Download `makemkv-oss-<v>.tar.gz` and `makemkv-bin-<v>.tar.gz`, and check both sha256s.
+  3. Build a static, audio-only ffmpeg into `/opt/ffmpeg`:
+     `--enable-static --disable-shared --disable-programs --disable-doc --disable-everything --disable-network --disable-autodetect --enable-parser='*' --enable-decoder='pcm*,flac,aac,ac3,eac3,dca,truehd,mlp,mp2,mp3,vorbis,opus,alac' --enable-encoder='flac,pcm*'`.
+  4. makemkv-oss: `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig ./configure --prefix=/usr/local --disable-gui && make && make install`.
+  5. makemkv-bin: `mkdir -p tmp && touch tmp/eula_accepted && make && make install`.
+  
+  This replaces `manual-build/install/install.sh` and fixes its `$version` bug. There is no forum scraping.
+- `scripts/collect-rootfs.sh <out> <binaries...>`:
+  - copy each binary, and every `/usr/local/lib/*.so*`, with `cp --parents -L`;
+  - copy the `ldd` closure of all of them (paths after `=>`), excluding the libraries
+    `cc-debian13` already ships (`libc libm libdl libpthread librt libresolv libstdc++ libgcc_s libgomp libssl libcrypto libz libzstd`);
+  - for each Debian package owning a copied file (`dpkg -S`), write `dpkg-query -s <pkg>` to
+    `<out>/var/lib/dpkg/status.d/<pkg>`, so image scanners (Trivy) can see them.
+- **Rule:** the final stage has **no `RUN`**. Every tool ripper execs is an ELF binary copied with its
+  library closure. The image has no shell.
+- Test (`task image`):
+  - `docker run --rm ripper:dev version` works;
+  - `docker run --rm --entrypoint /usr/local/bin/makemkvcon ripper:dev` prints its usage;
+  - each copied tool runs `--version`/`-V` via `--entrypoint`;
+  - Trivy finds the copied packages.
 
 **P4.2 Delete legacy**
-- Delete `root/` entirely; the defaults were moved in P2.3.
-- Delete `docker-compose.yml`; it is replaced in P4.4.
+- Delete `root/` entirely (the MakeMKV profile moved in P2.3; `abcde.conf` is no longer used).
+- Delete `latest/`, `manual-build/` and `docker-compose.yml`; the compose file is replaced in P4.4.
 
 **P4.3 Workflows**
-- `ci.yml`: add the `image` job (build both Dockerfiles, no push, Trivy per L§3, smoke test
-  `docker run --rm <image> version`).
-- `release.yml`: add the `publish` job (L§5).
-- Add `rebuild.yml` (L§5).
+- `ci.yml`: add the `image` job (build the Dockerfile for amd64, no push; Trivy per L§3; the P4.1 smoke tests).
+- `release.yml`: add the `publish` job (L§5). Build natively per architecture (`ubuntu-latest` for
+  amd64, `ubuntu-24.04-arm` for arm64; no QEMU, because the MakeMKV/ffmpeg build is slow under
+  emulation), push by digest, then merge with `docker buildx imagetools create`.
 - Delete `BuildImages.yml`, `IssueModerator.yml`, `LabelSponsors.yml`, `UpdateOnBaseImageChange.yml`
   and `ManualBuildOnBetaRelease.yml`.
 - This PR's title: `feat!: replace the bash/python implementation with the Go ripper`, with a
@@ -385,7 +447,6 @@ CMD ["serve"]
   services:
     ripper:
       image: ghcr.io/jacaudi/docker-ripper:latest
-      init: true
       stop_grace_period: 30s
       restart: unless-stopped
       devices: ["/dev/sr0:/dev/sr0", "/dev/sg0:/dev/sg0"]
@@ -400,7 +461,8 @@ CMD ["serve"]
   `terminationGracePeriodSeconds: 30`, liveness `/healthz` and readiness `/readyz` on 9091.
 
 **P4.5 Hardware acceptance (owner)**
-- With the built image: one rip each of a DVD, a BluRay, an audio CD and a data CD.
+- With the built image: one rip each of a DVD, a BluRay (ideally with DTS-HD or TrueHD audio), an
+  LPCM DVD, an audio CD (check the tags and cover) and a data CD.
 - Check that `makemkvcon reg` alone registers the key (`~/.MakeMKV/settings.conf` contains `app_Key`).
   If it doesn't, stop and ask.
 - Cancel one rip with `docker stop` and confirm the partial output is gone.

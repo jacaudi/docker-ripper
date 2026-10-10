@@ -32,7 +32,8 @@ Module path: `github.com/jacaudi/docker-ripper`. All packages below live under i
 |---|---|---|---|---|
 | `RIPPER_DRIVES` | `drives` / `Drives` | []string (comma-sep) | `/dev/sr0` | ≥ 1 entry; each absolute; basenames unique (the basename is the **drive ID**, e.g. `sr0`) |
 | `RIPPER_OUTPUT_DIR` | `output_dir` / `OutputDir` | string | `/out/Ripper` | absolute. Fixed subdirs `BluRay/ DVD/ CD/ DATA/` |
-| `RIPPER_CONFIG_DIR` | `config_dir` / `ConfigDir` | string | `/config` | absolute. Optional overrides `abcde.conf`, `default.mmcp.xml` |
+| `RIPPER_CONFIG_DIR` | `config_dir` / `ConfigDir` | string | `/config` | absolute. Optional override `default.mmcp.xml`. The image sets `HOME=/config`, so `~/.MakeMKV` lives here too |
+| `RIPPER_AUDIO_FORMATS` | `audio_formats` / `AudioFormats` | []string (comma-sep) | `flac,mp3` | ≥ 1 entry; each `flac` or `mp3`; no duplicates |
 | `RIPPER_EJECT` | `eject` / `Eject` | bool | `true` | `false` = leave the disc for manual removal |
 | `RIPPER_ISO_MODE` | `iso_mode` / `ISOMode` | string | `off` | one of `off`, `also`, `only` |
 | `RIPPER_MIN_TITLE_LENGTH` | `min_title_length` / `MinTitleLength` | int (s) | `600` | ≥ 0; MakeMKV `--minlength` |
@@ -110,7 +111,7 @@ func (k Kind) String() string
 func (k Kind) MarshalText() ([]byte, error)
 ```
 
-### 2.2 Seams (five; the interface lives in the seam package, backends in sub-packages)
+### 2.2 Seams (six; the interface lives in the seam package, backends in sub-packages)
 
 ```go
 // internal/runner
@@ -119,6 +120,7 @@ package runner
 type Cmd struct {
 	Name string   // executable, resolved via PATH
 	Args []string
+	Dir  string   // working directory; "" = inherit
 	Tool string   // log attribute value, e.g. "makemkvcon"
 }
 
@@ -153,9 +155,34 @@ type Detector interface {
 package rip
 
 // Ripper writes its output into dir. The engine created dir (a staging dir) and owns it.
+// It returns the name the finalized directory should get ("" = keep the name derived from the
+// disc label). Only the audio ripper returns a name ("<Artist> - <Album>"), because an audio CD
+// has no label and its name is known only after the metadata lookup.
 // On ctx cancellation it returns promptly; the engine deletes the staging dir.
 type Ripper interface {
-	Rip(ctx context.Context, d disc.Disc, dir string) error
+	Rip(ctx context.Context, d disc.Disc, dir string) (name string, err error)
+}
+```
+
+```go
+// internal/meta
+package meta
+
+type Track struct {
+	Number int
+	Title  string
+	Artist string // equals Album.Artist unless Various
+}
+
+type Album struct {
+	Artist, Title, Date string // Date: "YYYY" or "YYYY-MM-DD" or ""
+	Various             bool
+	Tracks              []Track // one per audio track, in order
+	CoverURL            string  // "" = no cover
+}
+
+type Lookup interface {
+	Lookup(ctx context.Context, toc cdda.TOC) (Album, error)
 }
 ```
 
@@ -198,7 +225,11 @@ type Notifier interface {
 | `internal/runner/execrunner` | `New(logger *slog.Logger, tracer trace.Tracer, meter metric.Meter) (*Runner, error)` | `runner.Runner` |
 | `internal/detect/makemkv` | `NewScanner(r runner.Runner, timeout time.Duration) *Scanner` (one per process, shared by all drives); `New(s *Scanner, r runner.Runner, device string) *Detector`; `func ParseDRV(out []byte, device string) (disc.Disc, error)`; `ErrNoDriveLine`, `ErrMalformed` | `detect.Detector` |
 | `internal/rip/makemkv` | `New(r runner.Runner, configDir string, minLength int) (*Ripper, error)`; embeds `default.mmcp.xml` | `rip.Ripper` |
-| `internal/rip/abcde` | `New(r runner.Runner, device, configDir string) (*Ripper, error)`; embeds `abcde.conf` | `rip.Ripper` |
+| `internal/cdda` | `type TOC struct{ First, Last int; Offsets []int; Leadout int }` (sector offsets, **without** the 150-sector lead-in); `ParseTOC(cdparanoiaQ []byte) (TOC, error)`; `(TOC) MusicBrainzID() string`; `(TOC) CDDBID() string` | — (pure) |
+| `internal/meta/musicbrainz` | `New(d outbound.Doer, baseURL, coverURL string) *Lookup`; `const DefaultBaseURL = "https://musicbrainz.org/ws/2"`, `const DefaultCoverURL = "https://coverartarchive.org"` | `meta.Lookup` |
+| `internal/meta/none` | `type Lookup struct{}`: Artist `Unknown Artist`, Title `Disc <CDDBID>`, tracks `Track NN` | `meta.Lookup` |
+| `internal/meta` | `type Fallback struct{ Primary, Secondary Lookup; Logger *slog.Logger }`: on a Primary error, logs `metadata lookup failed` and returns Secondary | `meta.Lookup` |
+| `internal/rip/audio` | `New(r runner.Runner, m meta.Lookup, d outbound.Doer, device string, formats []string) *Ripper` | `rip.Ripper` |
 | `internal/rip/ddrescue` | `New(r runner.Runner, device string) *Ripper` | `rip.Ripper` |
 | `internal/eject/execeject` | `New(r runner.Runner, device string) *Ejector` | `eject.Ejector` |
 | `internal/notify/apprise` | `New(urls []string) (*Notifier, error)` | `notify.Notifier` |
@@ -352,14 +383,14 @@ An empty label never changes the classification.
 6. **State Inserted:** set state ripping, `StartedAt = Now()`, then run the rip plan (§3.4) step by step.
    For each step:
    - `dir, err := Output.Prepare(kindDir, cfg.Drive, d.Label, Now())`.
-   - `err = ripper.Rip(ctx, d, dir)`.
+   - `name, err := ripper.Rip(ctx, d, dir)`.
    - If `ctx.Err() != nil` (shutdown):
      - `Output.Cleanup(dir)` using `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`;
      - record outcome `cancelled`;
      - `notifyDetached(Stopped, "Ripper stopped", "shutdown during rip of <label>")`;
      - **do not eject**; return `nil`.
    - If `err != nil`: `Output.Cleanup(dir)`, record outcome `failure`, skip the remaining steps.
-   - Else: `path, err := Output.Finalize(kindDir, dir)`. Append `path` to the result. A Finalize
+   - Else: `path, err := Output.Finalize(kindDir, dir, name)`. Append `path` to the result. A Finalize
      error counts as `failure`.
 7. **After the plan:**
    - If `cfg.Eject`: set state ejecting and call `Eject(ctx)`. An error is logged at ERROR and does
@@ -400,7 +431,8 @@ type Settings struct {
 func NewPlanner(s Settings) (*Planner, error)                   // os.OpenRoot(OutputDir); creates the 4 kind dirs
 func (p *Planner) CleanStaging() error
 func (p *Planner) Prepare(kindDir, drive, label string, now time.Time) (dir string, err error)
-func (p *Planner) Finalize(kindDir, dir string) (path string, err error)
+func (p *Planner) Finalize(kindDir, dir, name string) (path string, err error)
+func Sanitize(s string) string // the rule below, without the empty-string fallback
 func (p *Planner) Cleanup(ctx context.Context, dir string) error
 func (p *Planner) Close() error
 
@@ -422,13 +454,12 @@ const (
 - **Prepare:** returns the absolute path of `<kindDir>/.staging/<YYYYMMDD_HHMMSS>-<drive>/<name>`, created
   with mode 0o777 (the umask applies). `<name>` is the sanitised label, so the ISO backend can name
   its files `<name>.iso` / `<name>.map`.
-- **Finalize:**
-  - **BluRay/DVD/DATA:** the target is `<kindDir>/<name>`. If that exists, use `<name>_<YYYYMMDD_HHMMSS>_<drive>`.
-    If that also exists, fail with an error. Then one `Root.Rename(staging, target)`, then remove
-    `<kindDir>/.staging/<ts>-<drive>`.
-  - **CD:** move each child of the staging dir except `.wav` to `CD/<child>`, using the same
-    collision rule. Then remove `CD/.staging/<ts>-<drive>`. The returned path is the first moved child.
-  - Then apply ownership and permissions recursively to each finalized path (§5.4).
+- **Finalize** (same for every kind):
+  - Final name = `Sanitize(name)` if `name != ""` and that is non-empty, else `base(dir)`.
+  - The target is `<kindDir>/<final>`. If that exists, use `<final>_<YYYYMMDD_HHMMSS>_<drive>`.
+    If that also exists, fail with an error.
+  - One `Root.Rename(dir, target)`, then remove `<kindDir>/.staging/<ts>-<drive>`.
+  - Then apply ownership and permissions recursively to the finalized path (§5.4).
   - Staging lives inside its kind dir, so a rename never crosses a mount (no `EXDEV` when kind dirs
     are separate bind mounts).
 - **Cleanup:** `Root.RemoveAll(<kindDir>/.staging/<ts>-<drive>)`.
@@ -440,18 +471,58 @@ const (
 | detect | `makemkvcon` | `-r --cache=1 info disc:9999` |
 | audio check | `cdparanoia` | `-d <DRIVE> -Q` |
 | BluRay/DVD rip | `makemkvcon` | `--profile=<profilePath> -r --decrypt --minlength=<MIN_TITLE_LENGTH> mkv disc:<Index> all <dir>` |
-| audio rip | `abcde` | `-d <DRIVE> -c <perRipConf> -N -l` (no `-x`; the engine is the only ejector) |
+| audio extract | `cdparanoia` | `-d <DRIVE> -q -B` with `Cmd.Dir = <dir>/.wav` (writes `trackNN.cdda.wav`) |
+| FLAC encode | `flac` | `-s -8 -f -T TITLE=<t> -T ARTIST=<a> -T ALBUM=<al> -T DATE=<d> -T TRACKNUMBER=<n> -T TRACKTOTAL=<N> [--picture=<dir>/cover.jpg] -o <dir>/<file>.flac <wav>` |
+| MP3 encode | `lame` | `--quiet -V2 --tt <t> --ta <a> --tl <al> --ty <d> --tn <n>/<N> [--ti <dir>/cover.jpg] <wav> <dir>/<file>.mp3` |
 | ISO | `ddrescue` | `<DRIVE> <dir>/<base(dir)>.iso <dir>/<base(dir)>.map` |
 | eject | `eject` | `-v <DRIVE>`. On error: wait 2 s, `sdparm --command=unlock <DRIVE>`, wait 1 s, `sdparm --command=eject <DRIVE>`; return the last error |
 | register | `makemkvcon` | `reg <KEY>` |
 
 - **profilePath:** `<CONFIG_DIR>/default.mmcp.xml` if it exists. Otherwise the embedded default,
   written once by `rip/makemkv.New` to `os.MkdirTemp("", "ripper-")`.
-- **perRipConf:** a temp file containing the base conf (`<CONFIG_DIR>/abcde.conf` if it exists,
-  else the embedded default), followed by
-  `\n# ripper overrides\nOUTPUTDIR=<dir>\nWAVOUTPUTDIR=<dir>/.wav\nEJECTCD=n\n`.
-  Delete it after the rip.
-- The base files are resolved once, at construction. Restart to pick up edits.
+- The profile is resolved once, at construction. Restart to pick up edits.
+- Optional `-T`/`--t*` values that are empty are omitted (no empty tags).
+
+### 3.6a Audio ripper (`rip/audio`)
+
+1. `out := Output(ctx, cdparanoia -d <DRIVE> -Q)`, then `toc, err := cdda.ParseTOC(out)`. Parse the
+   table between the `===` line and `TOTAL`. Columns: `N.`, length, `[mm:ss.ff]`, begin, `[…]`, …
+   `Leadout = begin(last) + length(last)`. Only audio tracks are listed, so for enhanced CDs the
+   disc ID covers the audio session only (documented limitation).
+2. `album := meta.Lookup(ctx, toc)`. The patchbay always wraps with `meta.Fallback{MusicBrainz, none}`,
+   so a lookup failure never fails the rip. If `len(album.Tracks) != toc.Last-toc.First+1`, use
+   `none`'s tracks with the album's artist and title.
+3. If `album.CoverURL != ""`: GET it through the outbound Doer into `<dir>/cover.jpg` (max 10 MiB).
+   Failure → log `cover fetch failed`, continue without a cover.
+4. `mkdir <dir>/.wav`; run the extract command (§3.6).
+5. For each track `n` (sequentially) and each format in `RIPPER_AUDIO_FORMATS`, in that order: run the
+   encode command. File base name:
+   - normal: `NN. <Title>`;
+   - Various: `NN. <Artist> - <Title>`.
+   
+   Each part is passed through `output.Sanitize`; `NN` is two digits.
+6. Remove `<dir>/.wav`. Keep `cover.jpg`.
+7. Return the name `<Artist> - <Album>`, or `Various - <Album>` when `Various`.
+
+**MusicBrainz backend:**
+- GET `<base>/discid/<MusicBrainzID>?inc=recordings+artist-credits&fmt=json`. 404 or no releases → error.
+- Pick the first release whose media list contains this disc ID. Use the matching medium's tracks
+  (title, credited artist).
+- `Various` is true when the release artist is `Various Artists` or any track artist differs from the release artist.
+- `Date` is the release date. `CoverURL` = `<coverURL>/release/<release-id>/front-500`.
+- Client: kit `outbound` with `Product: "ripper"`, the contact URL, `RequestsPerSecond: 1`, `Burst: 1`,
+  `MaxAttempts: 2`, and `Timeout: 15s`. Put a comment at the construction site: MusicBrainz requires
+  an identifying User-Agent and at most 1 req/s.
+
+**Disc IDs** (`cdda`):
+- `MusicBrainzID`: SHA-1 over the uppercase hex string `%02X` First, `%02X` Last, then 100 × `%08X`
+  offsets (index 0 = Leadout+150; 1..99 = track offsets+150, zero for absent tracks). Base64-encode
+  it (standard alphabet) and replace `+`→`.`, `/`→`_`, `=`→`-`.
+- `CDDBID`: the classic freedb algorithm (digit sum of each track's start seconds mod 255, total
+  seconds, track count), as `%08x`.
+- Tests: use at least three published test vectors (TOC → MusicBrainz ID and CDDB ID) from the
+  libdiscid test suite or the MusicBrainz Disc ID documentation, and cite the source in a comment.
+  **Do not invent vectors.**
 
 ### 3.7 Notifications
 
@@ -478,7 +549,7 @@ const (
    Any error here: log WARN and continue.
 5. `output.NewPlanner` → `CleanStaging()` (once, before any engine starts).
 6. `patchbay.Backends` builds one `engine.Deps` per drive (sharing one Scanner, Planner, Notifier,
-   Logger, Tracer and Metrics) → one `*engine.Engine` per drive → `patchbay.Spec` → `lifecycle.Run`.
+   metadata Lookup (`meta.Fallback{musicbrainz, none}` with its own outbound client, C§3.6a), Logger, Tracer and Metrics) → one `*engine.Engine` per drive → `patchbay.Spec` → `lifecycle.Run`.
 
 Never log the key, the apprise URLs, or the web password. `execrunner` never logs argv (§5.1),
 so `makemkvcon reg <key>` is safe to run through it.
@@ -657,7 +728,7 @@ c, err := outbound.New(outbound.Config{Product: "ripper", Version: version(),
 - `FetchBetaKey`: GET the url; regex `T-[\w@]{66}`; return the first match; no match →
   `errors.New("makemkvkey: no beta key found")`.
 - Known limitation: the key is fetched once per process start. A long-running container needs a
-  restart after the beta key rotates. The weekly image rebuild plus `restart: unless-stopped`
+  restart after the beta key rotates. Auto-released MakeMKV bumps (L§5) plus `restart: unless-stopped`
   covers this.
 
 ### 5.6 `ripper detect`
@@ -732,6 +803,7 @@ units exactly; do not add labels.
 | `ripper.tool.runs`, Int64Counter, `{run}` | `ripper_tool_runs_total` | `tool`, `result` (`ok`, `exit_error`, `cancelled`, `error`) | execrunner | after each Run/Output |
 | `ripper.tool.duration`, Float64Histogram, `s` | `ripper_tool_duration_seconds` | `tool` | execrunner | same; default buckets |
 | `ripper.notifications`, Int64Counter, `{notification}` | `ripper_notifications_total` | `kind`, `result` (`ok`, `error`) | engine (`notifyDetached`) | after each Notify |
+| `ripper.meta.lookups`, Int64Counter, `{lookup}` | `ripper_meta_lookups_total` | `result` (`hit`, `fallback`) | `meta.Fallback` | after each audio-CD lookup |
 
 - Every label value comes from a fixed set: drive IDs from config, the enums in C§2, and tool
   names. Labels, disc labels, paths and errors are **never** metric labels.
@@ -792,6 +864,8 @@ Rules:
 | `tool failed` | WARN | tool, exit_code, error |
 | `notification failed` | WARN | kind, error |
 | `cleanup failed` | ERROR | drive, error |
+| `metadata lookup failed` | WARN | error |
+| `cover fetch failed` | WARN | error |
 
 ### 6.4 Traces
 

@@ -43,7 +43,10 @@ internal/detect/makemkv/testdata/cdparanoia/<case>.txt  raw `cdparanoia -d /dev/
 - Expectations live in a table in `drv_test.go`: `{file, device, wantState, wantKind, wantLabel, wantIndex, wantErr}`.
 - Required DRV cases: `empty`, `open`, `loading`, `dvd`, `bluray`, `uhd`, `cd`, `blank_label_dvd`,
   `two_drives` (target on index 1), `index_10`, `garbage`, `no_drive_line`.
-- Required cdparanoia cases: `audio`, `no_audio`.
+- Required cdparanoia cases: `audio` (a 2-track TOC table), `no_audio`.
+- `internal/cdda/testdata/`: published TOC vectors with their MusicBrainz and CDDB IDs (C§3.6a; cite the source).
+- `internal/meta/musicbrainz/testdata/`: a recorded `discid` JSON response (single artist) and one
+  for Various Artists.
 - Synthetic files look like real output: `MSG:` lines first, then `DRV:0..15`, with absent drives
   as `DRV:N,256,999,0,"","",""`. Example target line:
   `DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE  WH16NS40 1.05","MOVIE","/dev/sr0"`.
@@ -68,20 +71,23 @@ Tool name = `filepath.Base(os.Args[0])`. Everything is driven by `$FAKEBIN_DIR`:
 | `<tool>.<n>.stdout` / `<tool>.<dev>.stdout` / `<tool>.stdout` | stdout for call n, else for the device (`<dev>` = basename of the first arg starting with `/dev/`, e.g. `cdparanoia.sr1.stdout`), else the default. Missing = no output |
 | `<tool>.<n>.stderr` / `<tool>.<dev>.stderr` / `<tool>.stderr` | same lookup order, for stderr |
 | `<tool>.<n>.exit` / `<tool>.<dev>.exit` / `<tool>.exit` | exit code as a decimal (default `0`), same lookup order |
-| `<tool>.creates` | one path template per line, each created as a file containing `fake` (parents created). Templates: `{arg:N}` (0-based arg), `{lastarg}`, `{abcde_outputdir}` (the `OUTPUTDIR=` value read from the file after `-c`). Applied only for a `makemkvcon` call whose args contain `mkv`, and always for `ddrescue` and `abcde` |
+| `<tool>.creates` | one path template per line, each created as a file containing `fake` (parents created). Templates: `{arg:N}` (0-based arg), `{lastarg}`, `{flag:X}` (the arg after flag `X`, e.g. `{flag:-o}`), `{cwd}` (the working directory). Applied only for a `makemkvcon` call whose args contain `mkv`, a `cdparanoia` call whose args contain `-B`, and always for `ddrescue`, `flac` and `lame` |
 | `<tool>.block` | if present: after recording the call, block until `<tool>.release` exists (poll 50 ms) or SIGTERM arrives. On SIGTERM exit 143 **without** applying `creates` |
 
 Typical setups:
 - **BluRay:** `makemkvcon.1.stdout` = the bluray fixture; `makemkvcon.3.stdout` = the empty
   fixture (call 2 is the rip); `makemkvcon.creates` = `{lastarg}/title_t00.mkv`.
 - **ISO:** `ddrescue.creates` = `{arg:1}` and `{arg:2}` (the `.iso` and `.map` files).
-- **Audio CD:** `abcde.creates` = `{abcde_outputdir}/Artist-Album/01.Track.flac`.
+- **Audio CD:** `cdparanoia.creates` = `{cwd}/track01.cdda.wav` and `{cwd}/track02.cdda.wav`;
+  `flac.creates` = `{flag:-o}`; `lame.creates` = `{lastarg}`. The `audio` cdparanoia fixture lists 2 tracks.
 
 ## 4. End-to-end smoke (`internal/patchbay/e2e_test.go`)
 
 - Build the full stack with `patchbay.Backends` + `patchbay.Spec`:
   - `RIPPER_OUTPUT_DIR` = temp dir; `RIPPER_POLL_INTERVAL=1s`; `RIPPER_HEADLESS=true`;
   - apprise target `json://127.0.0.1:<port>` pointing at an `httptest` server;
+  - `patchbay.Options{Meta: fakeLookup}` returning `Artist` / `Album` / tracks `Song 1`, `Song 2`
+    (no network in tests);
   - listeners on `127.0.0.1:0`; fakebin on `PATH`.
 - Run `lifecycle.Run` in a goroutine.
 - Poll `GET /api/v1/status` until every drive has a `last_result` (timeout 20 s), then cancel and wait for `Run` to return.
@@ -96,10 +102,10 @@ Typical setups:
 | Scenario | Setup | Assert |
 |---|---|---|
 | `bluray` | bluray then empty | calls: info, `mkv … disc:0 all <staging>`, eject; `BluRay/MOVIE/title_t00.mkv` exists; no `.staging` left; Success notification; `awaiting_removal` cleared after empty |
-| `audio_cd` | empty + cdparanoia `audio` | abcde without `-x`; `CD/Artist-Album/01.Track.flac`; Success |
+| `audio_cd` | empty + cdparanoia `audio` | cdparanoia `-B`, then flac ×2 and lame ×2 with tags; `CD/Artist - Album/01. Song 1.flac`, `…/02. Song 2.mp3`; no `.wav` left; Success |
 | `data_cd` | cd + cdparanoia `no_audio` | ddrescue with `.iso` + `.map`; `DATA/<label>/<label>.iso` |
 | `iso_only_dvd` | dvd, `RIPPER_ISO_MODE=only` | ddrescue only; no `mkv` call |
 | `cancel_mid_rip` | bluray + `makemkvcon.block` | cancel while blocked; `Run` returns nil; no `BluRay/MOVIE`, no `.staging/<ts>`; no eject call; Stopped notification |
 | `eject_disabled` | dvd ×3 then empty, `RIPPER_EJECT=false` | exactly one `mkv` call (no re-rip); no eject call; status `awaiting_removal` until empty |
 | `bad_drive` | garbage ×6 | `/readyz` returns 503 with `detector:sr0` failed after the 5th; one Failure notification; process still running |
-| `two_drives` | `RIPPER_DRIVES=/dev/sr0,/dev/sr1`; one makemkvcon fixture listing sr0 = bluray and sr1 = cd; `cdparanoia.sr1.stdout` = audio; `makemkvcon.block` released after abcde has started | **both rips run concurrently** (abcde starts before the BluRay rip finishes); `BluRay/MOVIE/…` and `CD/Artist-Album/…` exist; two Success notifications; status lists both drives |
+| `two_drives` | `RIPPER_DRIVES=/dev/sr0,/dev/sr1`; one makemkvcon fixture listing sr0 = bluray and sr1 = cd; `cdparanoia.sr1.stdout` = audio; `makemkvcon.block` released after the sr1 `cdparanoia -B` call is recorded | **both rips run concurrently** (cdparanoia `-B` starts before the BluRay rip finishes); `BluRay/MOVIE/…` and `CD/Artist - Album/…` exist; two Success notifications; status lists both drives |

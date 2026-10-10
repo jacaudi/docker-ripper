@@ -99,10 +99,9 @@ tasks:
     cmds: ['go build -trimpath -o {{.BIN}}/ripper ./cmd/ripper']
 
   image:
-    desc: Build both container images locally
+    desc: Build the container image locally
     cmds:
-      - docker build -f latest/Dockerfile -t ripper:dev .
-      - docker build -f manual-build/Dockerfile -t ripper:dev-manual .
+      - docker build -t ripper:dev .
 
   check:
     desc: Everything CI runs on a PR, except the image build
@@ -296,13 +295,13 @@ jobs:
     # buildx multi-arch, Trivy, push, cosign sign
 ```
 
-Image tags on release `vX.Y.Z`:
-- `latest/` Dockerfile (amd64 + arm64): `X.Y.Z`, `X.Y`, `latest`.
-- `manual-build/` (amd64): `X.Y.Z-manual`, `manual-latest`.
+Image tags on release `vX.Y.Z` (one distroless image, amd64 + arm64): `X.Y.Z`, `X.Y`, `latest`.
 
-`rebuild.yml` (weekly, Monday 03:17 UTC, plus manual dispatch): check out the **latest
-release tag**, rebuild both images (new MakeMKV beta), Trivy, then push the same tags and sign.
-This replaces the old forum-polling and base-image-polling workflows.
+**No scheduled rebuilds.** Every runtime input is pinned in the Dockerfile: the Debian builder tag,
+the distroless digest and `MAKEMKV_VERSION`. Renovate bumps them as `fix(deps): …` commits (§6), and
+release-please turns each one into a patch release, which publishes a new image. New MakeMKV
+versions, which the free beta key requires, therefore ship as soon as the Renovate PR is green and
+auto-merged. This replaces the old forum-polling and base-image-polling workflows.
 
 ## 6. Renovate — `renovate.json`
 
@@ -311,19 +310,36 @@ This replaces the old forum-polling and base-image-polling workflows.
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests", ":semanticCommits"],
   "postUpdateOptions": ["gomodTidy"],
+  "customDatasources": {
+    "makemkv": {
+      "defaultRegistryUrlTemplate": "https://www.makemkv.com/download/",
+      "format": "html"
+    }
+  },
   "customManagers": [
     {
       "customType": "regex",
       "managerFilePatterns": ["/^taskfile\\.yml$/"],
       "matchStrings": ["(?<currentValue>v?[\\d.]+)\\s+# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)"]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^Dockerfile$/"],
+      "matchStrings": ["ARG \\w+=(?<currentValue>\\S+)\\s+# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?"]
     }
   ],
   "packageRules": [
+    { "matchDepNames": ["makemkv"], "extractVersion": "makemkv-bin-(?<version>[\\d.]+)\\.tar\\.gz", "semanticCommitType": "fix", "automerge": true },
+    { "matchFileNames": ["Dockerfile"], "matchDepNames": ["debian", "gcr.io/distroless/cc-debian13"], "semanticCommitType": "fix", "automerge": true },
     { "matchManagers": ["npm"], "matchFileNames": ["web/**"], "groupName": "web" },
     { "matchDepNames": ["@scalar/api-reference"], "postUpgradeTasks": { "commands": ["task scalar:vendor"] } }
   ]
 }
 ```
+
+The `makemkv` custom datasource reads the download page's links, and `extractVersion` picks the
+version out of the `makemkv-bin-<v>.tar.gz` link. Verify it with `renovate --dry-run` in P4.1.
+Runtime pins are committed as `fix(deps)`, so they produce releases (§5); everything else stays `chore(deps)`.
 
 (`postUpgradeTasks` needs a self-hosted Renovate or an allow-list. On the hosted app, a Scalar
 bump PR fails CI until someone runs `task scalar:vendor` on the branch. That's acceptable and
@@ -335,8 +351,7 @@ documented in the PR template.)
 |---|---|---|
 | `ci.yml` | pull_request, push main | `pr-title` (PRs only), `go` (`task lint test vuln`; includes the e2e smoke), `ui` (`task ui:lint ui:test ui:build` + `git diff --exit-code web/src/api/schema.d.ts`), `image` (build both images + Trivy; no push) |
 | `security.yml` | pull_request, push main, weekly | CodeQL (go, javascript-typescript), OSV-Scanner, Scorecard (push/weekly only) |
-| `release.yml` | push main | release-please → publish on release |
-| `rebuild.yml` | weekly, dispatch | rebuild + push the latest release |
+| `release.yml` | push main | release-please → publish on release (native amd64 + arm64 builds, manifest merge) |
 
 All jobs: `actions/checkout`, `actions/setup-go` with `go-version-file: go.mod`,
 `actions/setup-node` with `node-version: 24`, `cache: npm` and `cache-dependency-path: web/package-lock.json`

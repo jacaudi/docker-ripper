@@ -34,15 +34,15 @@ The conversion is **not 1-to-1**. What carries over unchanged:
 Configuration, logging, the API, the UI and the error handling are redesigned. This fork
 **diverges from upstream permanently**.
 
-Out of scope: new output formats, re-implementing abcde's audio pipeline.
+Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's MKV; data is ISO).
 
 ## 2. Decisions log
 
 | # | Topic | Decision |
 |---|---|---|
-| 1 | Seam / Patchbay | One interface per capability (5 seams: runner, detect, rip, eject, notify). Backends are separate packages. `internal/patchbay` is the only place that selects them. |
+| 1 | Seam / Patchbay | One interface per capability (6 seams: runner, detect, rip, eject, notify, meta). Backends are separate packages. `internal/patchbay` is the only place that selects them. |
 | 2 | Entrypoint | `cmd/ripper/main.go` → `internal/cli` (cobra). Follows [go.dev module layout](https://go.dev/doc/modules/layout). |
-| 3 | Config | **viper only**, confined to `internal/cli`. A clean `RIPPER_*` set of 19 keys (C§1); no legacy names. |
+| 3 | Config | **viper only**, confined to `internal/cli`. A clean `RIPPER_*` set of 20 keys (C§1); no legacy names. |
 | 4 | Service framework | go-service-kit v0.3.0: `lifecycle`, `obs`, `httpapi`, `outbound`. |
 | 5 | Modes | `ripper serve` = engine + API + docs, plus the web UI unless `--headless`. |
 | 6 | Ports | API, UI and docs on `:9090`; admin (`/healthz`, `/readyz`, `/metrics`) on `:9091`. |
@@ -69,12 +69,14 @@ Out of scope: new output formats, re-implementing abcde's audio pipeline.
 | 27 | Native ioctl backends | Future note only (phases.md "Future"). |
 | 28 | Multiple drives | In scope: `RIPPER_DRIVES` list; one engine (lifecycle worker) per drive, rips run concurrently. One shared MakeMKV scan per tick, one output planner, one serialised notifier. Per-drive status, readiness checks and metric labels. |
 | 29 | Observability | Slot 0 = Prometheus pull (`:9091/metrics`) + JSON logs on stdout; liveness `/healthz` and readiness `/readyz` with documented schemas; a defined metric set, log schema + message catalogue, and spans (C§6). OTLP export of traces, metrics **and logs** when `OTEL_*` is set, implemented in go-service-kit `obs` (P2.0). |
+| 30 | Runtime image | **Distroless** `gcr.io/distroless/cc-debian13` (scratch is impossible: `makemkvcon` is a proprietary glibc binary). One image (amd64 + arm64); no shell, no interpreter, no `RUN` in the final stage. MakeMKV is built from source in a matching `debian:trixie` stage at a pinned version, with a static audio-only ffmpeg. Tools are copied with their library closure. PID 1 is `tini-static`, copied in. `HOME=/config`. |
+| 31 | Audio CDs | **abcde is replaced** by a Go pipeline (`rip/audio`): TOC from `cdparanoia -Q`, MusicBrainz lookup + Cover Art Archive via kit `outbound` (falls back to "Unknown Artist"), `cdparanoia -B` extraction, `flac`/`lame` encoding with tags and cover. `RIPPER_AUDIO_FORMATS=flac,mp3`. |
 
 ## 3. Glossary
 
 - **Seam**: the interface for one capability: `runner.Runner`, `detect.Detector`, `rip.Ripper`,
-  `eject.Ejector`, `notify.Notifier` (C§2.2).
-- **Backend**: one package implementing a seam, e.g. `rip/abcde` (C§2.3).
+  `eject.Ejector`, `notify.Notifier`, `meta.Lookup` (C§2.2).
+- **Backend**: one package implementing a seam, e.g. `rip/audio` (C§2.3).
 - **Patchbay**: `internal/patchbay`. `Backends(...)` picks the backends; `Spec(...)` assembles the
   HTTP servers, readiness and the `lifecycle.Spec`.
 - **Engine**: `internal/engine`, the detect → rip → finalize → eject → notify loop. It runs as a
@@ -102,7 +104,7 @@ Out of scope: new output formats, re-implementing abcde's audio pipeline.
 - Run `task lint test vuln` before every commit (`task check` once `web/` exists).
 - Use Conventional Commit messages and PR titles (L§4).
 - Keep seams at 1–2 methods, with a compile-time assertion in every backend.
-- Wrap errors with `%w` and context, e.g. `fmt.Errorf("abcde rip: %w", err)`.
+- Wrap errors with `%w` and context, e.g. `fmt.Errorf("audio rip: %w", err)`.
 
 **Do not**
 - Do not import viper or cobra outside `internal/cli`.
@@ -124,7 +126,7 @@ Out of scope: new output formats, re-implementing abcde's audio pipeline.
 | Principle | Concretely |
 |---|---|
 | KISS | One binary, one engine loop, one output root, one log stream, a UI with no router. |
-| YAGNI | 19 config keys; no backend switches; no parity harness; no log file; native ioctl deferred. |
+| YAGNI | 20 config keys; no backend switches; no parity harness; no log file; native ioctl deferred. |
 | DRY | One `rip.Ripper` interface and one staging/finalize path for every kind; TS types generated from the Go types; CI calls the tasks. |
 | SOLID | 5 small seams; substitutable backends; new backend = new package + one patchbay line; the engine depends only on seams; patchbay split into `Backends` and `Spec`. |
 | 12-Factor | Env config (+ one flag); logs to stdout; port binding via env; kit `lifecycle` for disposability; admin one-offs (`detect`, `healthcheck`). |
@@ -136,7 +138,13 @@ Out of scope: new output formats, re-implementing abcde's audio pipeline.
   - Kubernetes: a device-plugin DaemonSet ([generic-device-plugin](https://github.com/squat/generic-device-plugin/issues/62),
     [Talos guide](https://docs.siderolabs.com/kubernetes-guides/advanced-guides/device-plugins.md)),
     `replicas: 1`, `strategy: Recreate`, and a node selector.
-- **PID 1 is tini**: `ENTRYPOINT ["tini","--","ripper"]`, `CMD ["serve"]`. Compose uses `init: true`.
+- **Image**: distroless, with no shell. Debug with `docker debug` or `kubectl debug` (an ephemeral
+  container), not `docker exec … sh`.
+- **PID 1 is `tini-static`**, copied into the image: `ENTRYPOINT ["/usr/bin/tini-static","--","/usr/local/bin/ripper"]`,
+  `CMD ["serve"]`. Compose doesn't need `init: true`, and k8s (which has no init) is covered too.
+- **User**: root by default, because device nodes are `root:cdrom 660` on hosts and chowning output
+  needs `CAP_CHOWN`. Rootless recipe: `user: "1000:1000"` + `group_add: ["<host cdrom gid>"]`,
+  with `RIPPER_UID`/`RIPPER_GID` unset.
 - **Shutdown budget**:
   - `PropagationDelay: NoPropagationDelay`;
   - `DrainTimeout: 5s`;
@@ -176,11 +184,14 @@ Two trade-offs are accepted:
 | Tool | Decision | Backend |
 |---|---|---|
 | `makemkvcon` | keep (proprietary) | `detect/makemkv`, `rip/makemkv`, `makemkvkey.Register` |
-| `abcde` + cdparanoia/lame/flac/eyeD3/metaflac/glyrc | keep | `rip/abcde` |
+| `cdparanoia` | keep (ELF) | `detect/makemkv` (`-Q`), `rip/audio` (`-Q` for the TOC, `-B` to extract) |
+| `flac`, `lame` | keep (ELF) | `rip/audio` (encode + tag + cover) |
 | `ddrescue` | keep (with a map file) | `rip/ddrescue` |
-| `cdparanoia -Q` | keep | inside `detect/makemkv` |
-| `eject`, `sdparm` | keep | `eject/execeject` |
-| curl, grep/sed/cut/date/timeout, useradd, python/flask, phusion, syslog-ng | **remove** | apprise-go, kit, stdlib |
+| `eject`, `sdparm` | keep (ELF) | `eject/execeject` |
+| `tini-static` | keep (static) | PID 1 |
+| `abcde`, eyeD3 (Python), glyrc, cd-discid, metaflac, wget | **remove** | `rip/audio`, `cdda`, `meta/musicbrainz` |
+| `ccextractor` (closed captions), OpenJDK (BD-J menus) | **remove** | — (MakeMKV rips without them) |
+| curl, grep/sed/cut/date/timeout, useradd, bash, python/flask, phusion, syslog-ng | **remove** | apprise-go, kit, stdlib |
 
 ## 8. Migration notes (for the README)
 
@@ -200,6 +211,7 @@ Two trade-offs are accepted:
 | `PREFIX` / `USER` / `PASS` | `RIPPER_WEB_PATH_PREFIX` / `RIPPER_WEB_USERNAME` / `RIPPER_WEB_PASSWORD` |
 | `DEBUG`, `DEBUGTOWEB` | `RIPPER_LOG_LEVEL` |
 | `TIMESTAMPPREFIX`, `SEPARATERAWFINISH`, `BAD_THRESHOLD` | removed |
+| `/config/abcde.conf` | removed; use `RIPPER_AUDIO_FORMATS` |
 
 **Removed features**
 - `/config/ripper.sh` and the hook scripts (`BLURAYrip.sh`, `DVDrip.sh`, `CDrip.sh`, `DATArip.sh`).
@@ -213,16 +225,21 @@ Two trade-offs are accepted:
 **Behaviour changes**
 1. Detection uses ordered rules on parsed fields. An empty drive can no longer be "ripped" as a CD,
    and drive indexes ≥ 10 work.
-2. Data CDs are imaged with ddrescue instead of being sent to abcde. DVD/BD data discs are still
+2. Data CDs are imaged with ddrescue instead of being sent to the audio ripper. DVD/BD data discs are still
    treated as video.
 3. An unrecognised drive reply never triggers a rip or an eject.
 4. After any rip attempt the engine waits for the disc to be removed: no re-rip loops.
 5. Rips are staged and renamed into place. Partial output is removed on failure, on shutdown, and
    at the next start after a crash.
 6. `ddrescue` writes a `.map` file next to the `.iso`, so an interrupted ISO rip can resume.
-7. abcde no longer ejects; the ripper is the only thing that ejects. `RIPPER_EJECT=false` is now
-   honoured for CDs.
-8. `RIPPER_OUTPUT_DIR` decides where audio CDs go, even if your `abcde.conf` sets `OUTPUTDIR`.
+7. The ripper is the only thing that ejects (abcde used to eject CDs itself). `RIPPER_EJECT=false` is
+   now honoured for CDs.
+8. **Audio CDs no longer use abcde.**
+   - Metadata comes from MusicBrainz instead of gnudb/CDDB; a miss gives `Unknown Artist - Disc <id>`.
+   - The layout is fixed: `CD/<Artist> - <Album>/NN. <Title>.{flac,mp3}` with tags and an embedded
+     cover, plus `cover.jpg`.
+   - Formats are set by `RIPPER_AUDIO_FORMATS` (`flac`, `mp3`). `abcde.conf` is no longer read:
+     no ogg/opus, no custom file-name templates, no playlists, no replaygain.
 9. `ISO_MODE` skips audio CDs, which can't be imaged.
 10. `default.mmcp.xml` is now actually used: from `/config` if present, otherwise the built-in one.
 11. The MakeMKV key is never logged; `~/.MakeMKV` has mode 0700.
@@ -231,7 +248,10 @@ Two trade-offs are accepted:
 13. The API is `/api/v1/status` and `/api/v1/log`, with OpenAPI at `/openapi.json` and docs at `/docs`.
     Admin endpoints are on port 9091.
 14. The web UI is rewritten in React + Ant Design. Basic auth is constant-time, with CSRF protection.
-15. The image is `ubuntu:noble` + tools + tini + `ripper`, published to `ghcr.io/jacaudi/docker-ripper`.
+15. The image is distroless (`cc-debian13`), with no shell: one multi-arch image at
+    `ghcr.io/jacaudi/docker-ripper` replaces the `latest`/`manual-latest` pair. MakeMKV is pinned
+    and updated through releases. Closed-caption extraction (ccextractor) and BD-J menu support
+    (Java) are not included.
 16. Several drives can rip at the same time (`RIPPER_DRIVES`).
 
 ## 9. Repository admin (manual)
@@ -251,7 +271,12 @@ Two trade-offs are accepted:
 - **Concurrent MakeMKV instances** (multi-drive) are assumed to work; this is checked at P4.5 with two drives if available.
 - **`makemkvcon reg`** is assumed to write `app_Key` itself; this is checked at P4.5.
 - **DVD/BD data discs** are treated as video until a hardware capture shows a distinguishing signal.
-- **The beta key** is fetched once per start; the weekly rebuild and the restart policy cover rotation.
+- **The beta key** is fetched once per start; auto-released MakeMKV bumps and the restart policy cover rotation.
+- **MakeMKV source build in CI** depends on makemkv.com and a GPG keyserver. If it fails, the previous
+  image stays published. The audio-only ffmpeg codec set is checked at P4.5 with DTS-HD/TrueHD and LPCM discs.
+- **MusicBrainz coverage** differs from gnudb. Misses fall back to `Unknown Artist`, as abcde `-N` did on a CDDB miss.
+- **Scanner visibility**: copied libraries are visible to Trivy only through the `status.d` fragments
+  that `collect-rootfs.sh` writes.
 
 ## References
 
