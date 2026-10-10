@@ -330,7 +330,7 @@ auto-merged. This replaces the old forum-polling and base-image-polling workflow
   ],
   "packageRules": [
     { "matchDepNames": ["makemkv"], "extractVersion": "makemkv-bin-(?<version>[\\d.]+)\\.tar\\.gz", "semanticCommitType": "fix", "automerge": true },
-    { "matchFileNames": ["Dockerfile"], "matchDepNames": ["debian", "gcr.io/distroless/cc-debian13"], "semanticCommitType": "fix", "automerge": true },
+    { "matchFileNames": ["Dockerfile"], "matchDepNames": ["debian", "gcr.io/distroless/cc-debian13", "cyanreg/cyanrip"], "semanticCommitType": "fix", "automerge": true },
     { "matchManagers": ["npm"], "matchFileNames": ["web/**"], "groupName": "web" },
     { "matchDepNames": ["@scalar/api-reference"], "postUpgradeTasks": { "commands": ["task scalar:vendor"] } }
   ]

@@ -100,7 +100,8 @@ Pinned versions (Renovate keeps them current afterwards):
 - Test (use `t.Setenv`):
   - defaults;
   - each `RIPPER_*` maps to its field;
-  - `RIPPER_DRIVES=/dev/sr0,/dev/sr1` → two entries; duplicate basenames → error;
+  - `RIPPER_DRIVES` unset → empty (auto-discover); `/dev/sr0,/dev/sr1` → two entries; duplicate basenames → error;
+  - `RIPPER_AUDIO_FORMATS=flac,ogg` → error; `RIPPER_MAX_PARALLEL_JOBS=-1` → error;
   - **empty env → default**;
   - `--headless` overrides `RIPPER_HEADLESS=false`;
   - comma list for `RIPPER_APPRISE_URLS`;
@@ -139,64 +140,55 @@ Pinned versions (Renovate keeps them current afterwards):
 
 ## Phase 2 — Engine and backends
 
-**P2.0 go-service-kit OTLP metrics + logs (owner, in `leftathome/go-service-kit`; does not block)**
-- Do: implement C§6.5 in the kit's `obs` package (with tests), and release it as `v0.4.0`.
-- Ripper keeps `v0.3.0` until that release exists; bumping it is a one-line `go get` in any later task.
-- Done when: the kit release exists and ripper's `go.mod` requires it.
+**P2.0 `internal/telemetry`**
+- Do: C§6.5. It is the only package that imports `obs`.
+- Test: `Setup` with an in-memory span exporter returns a working Logger, Tracer and Meter; a log
+  record reaches both stdout (captured writer) and the ring; `Shutdown` is idempotent.
 
 **P2.1 `internal/runner` + `execrunner`**
 - Do: C§2.2, C§5.1, plus its metrics (C§6.2) and `tool.run` span (C§6.4).
 - Test (fakebin):
   - stdout and stderr lines are logged with the `tool` attr;
   - argv never appears in any log record;
+  - `Cmd.Dir` is honoured (fakebin records `dir`);
   - exit code → `ExitError` via `errors.AsType`;
   - cancelling during `.block` returns within 6 s, and `syscall.Kill(-pgid, 0)` returns `ESRCH` afterwards;
   - `Output` is capped at 1 MiB;
-  - `ripper_tool_runs_total` is recorded with the right `result` (use an in-memory metric reader);
-  - a `tool.run` span is created (use the in-memory span exporter).
+  - `ripper_tool_runs_total` has the right `result` (in-memory metric reader);
+  - a `tool.run` span exists (in-memory span exporter).
 
 **P2.2 `detect/makemkv`**
-- Do: `ParseDRV` (C§3.1), the shared `Scanner` and the `Detector` (C§3.2).
+- Do: `ParseDRV` (C§3.1, all drives) and the `Detector` (C§3.2).
 - Test: the T§2 expectation table; detector cases with fakebin: timeout (`.block` with a 1 s
-  constructor timeout), the cdparanoia `audio` and `no_audio` paths, and makemkvcon exit 1.
-  Scanner: two detectors on the same tick → exactly one `makemkvcon` call; a call after 5 s → a new scan.
+  constructor timeout), the cdparanoia `audio`/`no_audio` paths per device
+  (`cdparanoia.sr1.stdout`), makemkvcon exit 1, and `no_drives`.
 
-**P2.3 Video and ISO rip backends**
-- Files: `rip/makemkv` (embed `default.mmcp.xml`, moved from `root/ripper/`), `rip/ddrescue`.
-- Do: argv exactly as in C§3.6, and the profile override resolution. Both return `name == ""`.
-- Test (fakebin): `calls.jsonl` argv; an override file wins over the embedded default; ddrescue
-  passes both the `.iso` and the `.map`.
+**P2.3 Rip backends**
+- Files: `rip/makemkv` (embed `default.mmcp.xml`, moved from `root/ripper/`), `rip/ddrescue`, `rip/cyanrip`.
+- Do: argv exactly as in C§3.6, including the profile resolution and the cyanrip retry and folder rule.
+  makemkv and ddrescue return `name == ""`; cyanrip returns the album folder name.
+- Test (fakebin):
+  - `calls.jsonl` argv and `dir`;
+  - the profile override wins over the embedded default;
+  - ddrescue passes both `.iso` and `.map`;
+  - cyanrip: success → files moved up and `name` returned; first exit 1 → a second call with `-N`;
+    both fail → error; zero or two created folders → error; cancel → prompt return.
 
-**P2.3a `internal/cdda`**
-- Do: `TOC`, `ParseTOC`, `MusicBrainzID`, `CDDBID` (C§2.3, C§3.6a). Pure Go, no I/O.
-- Test: the published vectors (T§2) and the `audio` cdparanoia fixture.
-
-**P2.3b `internal/meta` + backends**
-- Do: the seam (C§2.2), `meta/none`, `meta.Fallback` (with the `ripper.meta.lookups` metric), and
-  `meta/musicbrainz` (C§3.6a).
-- Test: the recorded JSON responses via httptest (single artist, Various Artists, 404 → error);
-  Fallback returns Secondary and logs on a Primary error.
-
-**P2.3c `rip/audio`**
-- Do: C§3.6a and the commands in C§3.6.
-- Test (fakebin + a fake `meta.Lookup` + an httptest cover):
-  - argv and tags for both formats;
-  - `RIPPER_AUDIO_FORMATS=flac` → no `lame` call;
-  - the Various layout;
-  - cover present → `--picture`/`--ti`; cover 404 → no cover flags and no failure;
-  - `.wav` removed;
-  - returned name;
-  - cancel during cdparanoia → returns promptly.
-  - Check once, with the real tools on a dev machine, that `lame --ti` and `flac --picture` embed the cover.
+**P2.3b cyanrip behaviour check (owner, hardware; does not block)**
+- Run `cyanrip -d /dev/srN -o flac` once with a CD that **is** in MusicBrainz and once with one that
+  **isn't**. Record each exit code and the folder layout.
+- If cyanrip doesn't exit non-zero on a MusicBrainz miss, **stop and ask**: the retry rule in C§3.6
+  must change.
 
 **P2.4 `eject/execeject`**
-- Do: the C§3.6 sequence. Inject waits as `sleep func(context.Context, time.Duration) error`.
+- Do: the C§3.6 sequence, with `device` as an argument. Inject waits as
+  `sleep func(context.Context, time.Duration) error`.
 - Test: success; `eject.exit=1` → sdparm unlock, then eject; the last error is returned.
 
 **P2.5 `notify/apprise` + `notify/nop`**
-- Do: C§5.2, C§3.7.
+- Do: C§5.2 (with the mutex), C§3.7.
 - Test against `json://127.0.0.1:<httptest port>`: title, body and type; a timeout returns
-  `context.DeadlineExceeded`; an invalid URL fails `New`.
+  `context.DeadlineExceeded`; an invalid URL fails `New`; 10 concurrent `Notify` calls are serialised (race-free).
 
 **P2.6 `internal/makemkvkey`**
 - Do: C§5.5 (`FetchBetaKey`) and `Register` (C§3.6).
@@ -205,51 +197,56 @@ Pinned versions (Renovate keeps them current afterwards):
 
 **P2.7 `internal/engine`**
 - Do: C§2.4, C§3.3, C§3.4, plus `metrics.go` (C§6.2), the spans (C§6.4) and the log messages (C§6.3).
-  Fakes per T§1.
-- Tests (all under synctest):
+- Tests (all under synctest, fakes per T§1):
   - every cell of C§3.4;
-  - repeated Empty/Open/Loading;
-  - bad replies: Ready fails at 5, one Failure notification, recovery resets the count;
-  - success → eject → awaiting removal → no re-rip while Inserted → cleared on Empty;
-  - `Eject: false`, and a failed eject: both give no re-rip;
-  - a rip failure: Cleanup called, Failure notification, eject, awaiting removal;
-  - cancel mid-rip: Cleanup, Stopped notification via the detached ctx, no eject, `Run` returns nil;
-  - `Status()` transitions;
-  - two engines (sr0, sr1) sharing a recording Notifier and a Planner run plans concurrently;
-  - metrics recorded per C§6.2 (in-memory reader); `engine.rip` / `rip.step` spans (in-memory exporter).
+  - discovery: drives appear and disappear; a drive with a running job is not removed;
+  - `Include` filter;
+  - Empty/Open/Loading → idle;
+  - per-drive Unknown ×5 → `unusable`, one Failure notification, recovery → `idle`;
+  - scanner errors ×5 → one Failure notification; `CheckScanner` fails;
+  - success → eject → `awaiting_removal` → no re-rip while Inserted → `idle` on Empty;
+  - `Eject: false`, and a failed eject: no re-rip;
+  - a failure → Cleanup, Failure notification, eject, `awaiting_removal`;
+  - queue: two drives with `MaxParallel 0` run concurrently; with `MaxParallel 1` the second waits
+    (`queued`) and starts after the first finishes; FIFO order across three drives;
+  - cancel: a running job → Cleanup, Stopped notification via the detached ctx, no eject; queued jobs
+    → `cancelled`; `Run` returns nil after the workers finish;
+  - `Jobs()` ordering and the history cap (51 jobs → 50 kept);
+  - `Started`, `CheckLoop` and `CheckDrives` semantics;
+  - metrics (in-memory reader) and spans (in-memory exporter).
 
-**P2.8 Patchbay + `serve` (headless engine, admin only)**
-- Files: `internal/patchbay/backends.go`, `internal/patchbay/spec.go`, `internal/cli/serve.go`,
-  `internal/cli/healthcheck.go`.
+**P2.8 `internal/health` + patchbay + `serve` (headless, admin only)**
+- Files: `internal/health/health.go`, `internal/patchbay/backends.go`, `internal/patchbay/spec.go`,
+  `internal/cli/serve.go`, `internal/cli/healthcheck.go`.
 - Do:
-  - `func Backends(cfg config.Config, run runner.Runner, p *obs.Providers, planner *output.Planner, opts Options) ([]engine.Deps, error)`:
-    one `Deps` per drive in `cfg.Drives`. Shared across drives: one `Scanner`, the `Planner`, one Notifier
-    (`notify/nop` when `AppriseURLs` is empty), one metadata Lookup, `p.Logger`, `p.Tracer`, and one
-    `engine.NewMetrics(p.Meter)`.
-  - The signature takes a final `opts Options` with `type Options struct{ Meta meta.Lookup }`. This is a
-    test-only seam: nil means `meta.Fallback{musicbrainz.New(client, DefaultBaseURL, DefaultCoverURL), none.Lookup{}}`.
-  - `func Spec(cfg config.Config, engines []*engine.Engine, p *obs.Providers, ring *logring.Ring) (lifecycle.Spec, error)`
-    with:
-    - the admin listener and readiness (C§4.2);
+  - `health`:
+    - `NewAdminServer` and the three Readiness instances, with exactly the checks in C§6.1;
+    - `type Handlers struct{ Startup, Health, Ready *httpapi.Readiness; Registry *prometheus.Registry }`;
+    - `func Checks(cfg config.Config, eng *engine.Engine, planner *output.Planner, reg *RegistrationResult, startup *atomic.Bool) Handlers`.
+  - `func Backends(cfg config.Config, run runner.Runner, tel *telemetry.Telemetry, planner *output.Planner) (engine.Deps, error)`:
+    one instance of each backend (C§2.3); `notify/nop` when `AppriseURLs` is empty; `engine.NewMetrics(tel.Meter)`.
+  - `func Spec(cfg config.Config, eng *engine.Engine, tel *telemetry.Telemetry, h health.Handlers, ring *logring.Ring) (lifecycle.Spec, error)`:
+    - the admin server from `health.NewAdminServer`; `Readiness: h.Ready`;
     - `PropagationDelay: lifecycle.NoPropagationDelay` (comment: single replica + Recreate);
-    - `DrainTimeout: 5*time.Second`;
-    - `Flush: p.Shutdown`, `Logger`, `MeterProvider`;
-    - one worker per engine: `lifecycle.Worker{Name: "engine:" + id, Run: eng.Run, FinishCurrentCycle: true, StopTimeout: 15*time.Second}`.
-      The kit cancels the context **immediately** in both modes; `FinishCurrentCycle` only means
-      "wait up to 15 s for the cleanup to finish".
-  - `serve` follows C§3.8.
-  - `healthcheck`: GET `http://127.0.0.1:<port of RIPPER_ADMIN_ADDR>/healthz`, 2 s timeout, exit 1 on non-200.
-- Test: a patchbay test with ephemeral listeners: `/healthz` 200 `ok`; `/readyz` 200 with `drive:sr0` and
-  `detector:sr0` checks; 503 with `drive:sr0` failed when the device path is missing; `/metrics`
-  serves `ripper_` series.
-- Done when: `task lint test vuln` passes.
+    - `DrainTimeout: 5*time.Second`; `Flush: tel.Shutdown`; `Logger`; `MeterProvider`;
+    - **one** worker: `lifecycle.Worker{Name: "engine", Run: eng.Run, FinishCurrentCycle: true, StopTimeout: 15*time.Second}`.
+      The kit cancels the context immediately; the 15 s is the cleanup budget for every running job.
+  - `serve` follows C§3.8 and sets the startup flag.
+  - `healthcheck` per C§6.1.
+- Test (patchbay, ephemeral listeners):
+  - `/livez` 200;
+  - `/startupz` 503 then 200;
+  - `/healthz` lists every C§6.1 check; 503 when `PATH` lacks a tool;
+  - `/readyz` 200, and 503 when no drives are discovered;
+  - `/metrics` serves `ripper_` series;
+  - `ripper healthcheck` exits 0 and 1 accordingly.
 
 **P2.9 `ripper detect`**
 - Do: C§5.6.
-- Test: a JSON array for one and two drives via fakebin; exit 0 for empty; exit 1 on makemkvcon exit 1.
+- Test: a JSON array for one and two drives via fakebin; exit 0 for no drives; exit 1 on makemkvcon exit 1.
 - **(owner):** run `ripper detect --raw` with a DVD, a BluRay, an audio CD, a data CD, an empty
-  drive and an open tray. Paste the output into the T§2 fixtures and fix the expectation table if
-  the hardware disagrees.
+  drive and an open tray, and with two drives if available. Paste the output into the T§2 fixtures
+  and fix the expectation table if the hardware disagrees.
 
 Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which arrives in P3.3).
 
@@ -258,11 +255,13 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 ## Phase 3 — HTTP and UI
 
 **P3.1 `internal/api`**
-- Files: `api.go` (`Register(h huma.API, prefix string, st StatusSource, logs LogSource)`, with
-  `type StatusSource interface{ Status() engine.Status }` and `type LogSource interface{ Lines(n int) []string }`),
+- Files: `api.go` (`Register(h huma.API, prefix string, eng EngineView, logs LogSource)`, with
+  `type EngineView interface{ Drives() []engine.DriveStatus; Jobs() []engine.Job }` and
+  `type LogSource interface{ Lines(n int) []string }`),
   `auth.go` (C§4.3), tests, `testdata/openapi.json` (golden).
 - Test (`humatest`):
-  - status 200 with one entry per drive, in `RIPPER_DRIVES` order;
+  - status 200 with one entry per drive (sorted by ID) and the queued/running counts;
+  - jobs 200 in `engine.Jobs()` order;
   - log 200 with N lines, newest first; `lines=0` → 422; `lines=2001` → 422;
   - auth: no creds → 401 with header; wrong → 401; right → 200; disabled when either is empty.
   - Golden: `OpenAPI().MarshalJSON()` with prefix `""` equals the golden file; `-update` rewrites it.
@@ -299,18 +298,23 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 - `App.tsx`:
   - `ConfigProvider` with `csp={{ nonce }}` and `theme={{ algorithm: theme.darkAlgorithm }}`;
   - `Layout` with a Header titled "Ripper", and Content holding a `Row` of `StatusCard`s (one per entry in
-    `drives`, `Col` span 24 on xs, 12 on lg) above `LogPanel`.
+    `drives`, `Col` span 24 on xs, 12 on lg), then `JobsTable`, then `LogPanel`. When there are no
+    drives, show an AntD `Empty` with "No drives detected".
 - `api/client.ts`: `createClient<paths>({ baseUrl: '.' })` (openapi-fetch).
 - `hooks/usePoll.ts`: `usePoll(fn, ms)` runs at mount and then every `ms` via `setInterval`, skips
   ticks while `document.hidden`, and clears on unmount.
-- `hooks/useStatus.ts`: polls `GET /api/v1/status` every 5000 ms and returns `drives`.
+- `hooks/useStatus.ts`: polls `GET /api/v1/status` every 5000 ms; `hooks/useJobs.ts`: polls `GET /api/v1/jobs` every 5000 ms.
+- `components/JobsTable.tsx`: AntD `Table` (`size="small"`, `pagination={{ pageSize: 10 }}`); columns
+  job ID, drive, kind, label, state (`Tag`: queued `default`, running `processing`, succeeded `success`,
+  failed `error`, cancelled `warning`, skipped `default`), queued/started/finished, paths, error.
 - `components/StatusCard.tsx` (props: one `Status`; no fetching of its own):
   - title = drive ID and device;
   - AntD `Card` + `Descriptions`: state, disc kind, label, device, started at + live elapsed,
     bad responses, last result (outcome, error, paths);
-  - state `Tag` colours: idle `default`, detecting `blue`, ripping `processing`, ejecting `cyan`,
-    awaiting_removal `gold`, stopped `red`;
-  - an `Alert` (error) when `bad_responses >= 5`.
+  - state `Tag` colours: idle `default`, queued `blue`, ripping `processing`, ejecting `cyan`,
+    awaiting_removal `gold`, unusable `red`;
+  - shows the current disc and job ID;
+  - an `Alert` (error) when the state is `unusable`.
 - `components/LogPanel.tsx`:
   - polls `GET /api/v1/log?lines=200` every 10000 ms;
   - AntD `Table` with `size="small"`, `pagination={false}`, `scroll={{ y: 600 }}`, columns
@@ -319,8 +323,8 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
   - unparseable lines render as `{msg: raw}` in monospace.
 - No router, no login form (the browser handles basic auth), no clear button.
 - Test (vitest + jsdom + testing-library, `fetch` mocked with `vi.fn`): StatusCard renders a tag
-  for each state and the bad-drive alert; App renders two cards for two drives; LogPanel renders a
-  parsed row and a raw row.
+  for each state and the unusable alert; App renders two cards for two drives, and `Empty` for none;
+  JobsTable renders each state; LogPanel renders a parsed row and a raw row.
 - Done when: `task ui:lint ui:test ui:build` passes and `internal/webui/dist/index.html` exists.
 
 **P3.5 `internal/webui`**
@@ -335,7 +339,7 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 
 **P3.6 Wire HTTP into the patchbay**
 - Do: in `Spec`, build the API listener with `httpapi.New` (C§4.1 options) and call `api.Register`
-  (StatusSource = engine, LogSource = ring) and `apidocs.Mount`; call `webui.Mount` unless headless;
+  (EngineView = engine, LogSource = ring) and `apidocs.Mount`; call `webui.Mount` unless headless;
   add the root redirects. Add the API server to `Servers`.
 - Test: hit every route in both modes.
 
@@ -348,12 +352,13 @@ Phase done when: `task lint test vuln` passes (`task check` needs `web/`, which 
 ## Phase 4 — Cutover
 
 **P4.1 Dockerfile (one image, distroless)**
-- Files: `Dockerfile` (repo root), `scripts/build-makemkv.sh`, `scripts/collect-rootfs.sh`, `.dockerignore`.
+- Files: `Dockerfile` (repo root), `scripts/build-media.sh`, `scripts/collect-rootfs.sh`, `.dockerignore`.
 - `Dockerfile` (fill in the pins; Renovate maintains them, L§6):
 ```dockerfile
 # syntax=docker/dockerfile:1
 ARG DEBIAN=trixie-YYYYMMDD-slim     # renovate: datasource=docker depName=debian versioning=regex:^trixie-(?<major>\d{8})-slim$
 ARG MAKEMKV_VERSION=X.Y.Z           # renovate: datasource=custom.makemkv depName=makemkv
+ARG CYANRIP_VERSION=vX.Y.Z          # renovate: datasource=github-tags depName=cyanreg/cyanrip
 
 FROM node:24-alpine AS ui
 WORKDIR /src/web
@@ -371,26 +376,24 @@ COPY . .
 COPY --from=ui /src/internal/webui/dist internal/webui/dist
 RUN CGO_ENABLED=0 go build -trimpath -o /ripper ./cmd/ripper
 
-FROM debian:${DEBIAN} AS makemkv
+FROM debian:${DEBIAN} AS media
 ARG MAKEMKV_VERSION
+ARG CYANRIP_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential pkg-config wget ca-certificates gnupg dirmngr nasm \
-      libexpat1-dev libssl-dev zlib1g-dev \
+      build-essential pkg-config wget git ca-certificates gnupg dirmngr nasm meson ninja-build \
+      libexpat1-dev libssl-dev zlib1g-dev libmp3lame-dev libopus-dev \
+      libcdio-paranoia-dev libmusicbrainz5-dev libcurl4-openssl-dev \
+      cdparanoia gddrescue eject sdparm tini \
  && rm -rf /var/lib/apt/lists/*
-COPY scripts/build-makemkv.sh /build.sh
-RUN /build.sh "${MAKEMKV_VERSION}"
-
-FROM debian:${DEBIAN} AS tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      cdparanoia flac lame gddrescue eject sdparm tini libexpat1 \
- && rm -rf /var/lib/apt/lists/*
-COPY --from=makemkv /usr/local /usr/local
+COPY scripts/build-media.sh /build.sh
+RUN /build.sh "${MAKEMKV_VERSION}" "${CYANRIP_VERSION}"
+# collect from this stage: it already has every runtime library the binaries link against
 COPY scripts/collect-rootfs.sh /collect.sh
-RUN /collect.sh /rootfs /usr/bin/cdparanoia /usr/bin/flac /usr/bin/lame /usr/bin/ddrescue \
-      /usr/bin/eject /usr/bin/sdparm /usr/bin/tini-static /usr/local/bin/makemkvcon
+RUN /collect.sh /rootfs /usr/bin/cdparanoia /usr/bin/ddrescue /usr/bin/eject /usr/bin/sdparm \
+      /usr/bin/tini-static /usr/local/bin/makemkvcon /usr/local/bin/cyanrip
 
 FROM gcr.io/distroless/cc-debian13:latest@sha256:<digest>
-COPY --from=tools /rootfs /
+COPY --from=media /rootfs /
 COPY --from=go /ripper /usr/local/bin/ripper
 ENV HOME=/config LANG=C.UTF-8
 VOLUME ["/config", "/out"]
@@ -399,15 +402,20 @@ HEALTHCHECK --interval=30s --timeout=3s CMD ["ripper","healthcheck"]
 ENTRYPOINT ["/usr/bin/tini-static","--","/usr/local/bin/ripper"]
 CMD ["serve"]
 ```
-- `scripts/build-makemkv.sh <version>` (bash, `set -euo pipefail`; runs in the builder only):
-  1. Download `makemkv-sha-<v>.txt` and verify it with GPG key `2ECF23305F1FC0B32001673394E3083A18042697`.
-  2. Download `makemkv-oss-<v>.tar.gz` and `makemkv-bin-<v>.tar.gz`, and check both sha256s.
-  3. Build a static, audio-only ffmpeg into `/opt/ffmpeg`:
-     `--enable-static --disable-shared --disable-programs --disable-doc --disable-everything --disable-network --disable-autodetect --enable-parser='*' --enable-decoder='pcm*,flac,aac,ac3,eac3,dca,truehd,mlp,mp2,mp3,vorbis,opus,alac' --enable-encoder='flac,pcm*'`.
-  4. makemkv-oss: `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig ./configure --prefix=/usr/local --disable-gui && make && make install`.
-  5. makemkv-bin: `mkdir -p tmp && touch tmp/eula_accepted && make && make install`.
+- `scripts/build-media.sh <makemkv-version> <cyanrip-version>` (bash, `set -euo pipefail`; builder only):
+  1. **ffmpeg** (static, shared by both): build into `/opt/ffmpeg` with
+     `--enable-static --disable-shared --disable-programs --disable-doc --disable-everything --disable-network --disable-autodetect --enable-libmp3lame --enable-libopus --enable-parser='*' --enable-decoder='pcm*,flac,aac,ac3,eac3,dca,truehd,mlp,mp2,mp3,vorbis,opus,alac' --enable-encoder='pcm*,flac,libmp3lame,libopus,aac,alac' --enable-muxer='flac,mp3,ogg,opus,ipod,mp4,wav' --enable-filter='aresample,aformat,anull,abuffer,abuffersink,volume,ebur128,replaygain' --enable-protocol=file`.
+     Note: this filter/muxer list is the expected cyanrip set; P4.1's test (`cyanrip -o help`) and
+     P4.5 confirm it, and the list grows if cyanrip needs more.
+  2. **MakeMKV:** download `makemkv-sha-<v>.txt` and verify it with GPG key
+     `2ECF23305F1FC0B32001673394E3083A18042697`; download `makemkv-oss-<v>.tar.gz` and
+     `makemkv-bin-<v>.tar.gz` and check their sha256s.
+     - oss: `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig ./configure --prefix=/usr/local --disable-gui && make && make install`.
+     - bin: `mkdir -p tmp && touch tmp/eula_accepted && make && make install`.
+  3. **cyanrip:** `git clone --depth 1 --branch <cyanrip-version> https://github.com/cyanreg/cyanrip`,
+     then `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig meson setup build --prefix=/usr/local --buildtype=release && ninja -C build install`.
   
-  This replaces `manual-build/install/install.sh` and fixes its `$version` bug. There is no forum scraping.
+  This replaces `manual-build/install/install.sh` (and fixes its `$version` bug). There is no forum scraping.
 - `scripts/collect-rootfs.sh <out> <binaries...>`:
   - copy each binary, and every `/usr/local/lib/*.so*`, with `cp --parents -L`;
   - copy the `ldd` closure of all of them (paths after `=>`), excluding the libraries
@@ -418,12 +426,13 @@ CMD ["serve"]
   library closure. The image has no shell.
 - Test (`task image`):
   - `docker run --rm ripper:dev version` works;
+  - `docker run --rm --entrypoint /usr/local/bin/cyanrip ripper:dev -o help` lists flac, mp3, opus, aac and alac;
   - `docker run --rm --entrypoint /usr/local/bin/makemkvcon ripper:dev` prints its usage;
   - each copied tool runs `--version`/`-V` via `--entrypoint`;
   - Trivy finds the copied packages.
 
 **P4.2 Delete legacy**
-- Delete `root/` entirely (the MakeMKV profile moved in P2.3; `abcde.conf` is no longer used).
+- Delete `root/` entirely (the MakeMKV profile moved in P2.3; `abcde.conf` is replaced by cyanrip).
 - Delete `latest/`, `manual-build/` and `docker-compose.yml`; the compose file is replaced in P4.4.
 
 **P4.3 Workflows**
@@ -449,7 +458,9 @@ CMD ["serve"]
       image: ghcr.io/jacaudi/docker-ripper:latest
       stop_grace_period: 30s
       restart: unless-stopped
-      devices: ["/dev/sr0:/dev/sr0", "/dev/sg0:/dev/sg0"]
+      devices:                       # pass each drive's srN AND its sgN node; all are discovered automatically
+        - /dev/sr0:/dev/sr0
+        - /dev/sg0:/dev/sg0
       ports: ["9090:9090"]
       volumes: ["./config:/config", "./rips:/out"]
       environment:
@@ -457,24 +468,37 @@ CMD ["serve"]
         RIPPER_GID: "1000"
         RIPPER_APPRISE_URLS: ""
   ```
-- `deploy/k8s/ripper.yaml`: `replicas: 1`, `strategy: Recreate`, a device-plugin resource,
-  `terminationGracePeriodSeconds: 30`, liveness `/healthz` and readiness `/readyz` on 9091.
+- `deploy/k8s/ripper.yaml`: `replicas: 1`, `strategy: Recreate`, device-plugin resources for each
+  drive's sr and sg nodes, `terminationGracePeriodSeconds: 30`, and on port 9091:
+  - `startupProbe` `/startupz` (`failureThreshold: 30`, `periodSeconds: 5`);
+  - `livenessProbe` `/livez`;
+  - `readinessProbe` `/readyz`.
+  
+  Add a ServiceMonitor for `/metrics` and an alert example on `/healthz` (via blackbox) or on
+  `ripper_scans_total{result="error"}`.
 
 **P4.5 Hardware acceptance (owner)**
 - With the built image: one rip each of a DVD, a BluRay (ideally with DTS-HD or TrueHD audio), an
-  LPCM DVD, an audio CD (check the tags and cover) and a data CD.
+  LPCM DVD, an audio CD and a data CD.
+- For the audio CD, check the tags, the cover and the AccurateRip result in cyanrip's log. Also rip a
+  CD that isn't in MusicBrainz (the retry rule).
 - Check that `makemkvcon reg` alone registers the key (`~/.MakeMKV/settings.conf` contains `app_Key`).
   If it doesn't, stop and ask.
 - Cancel one rip with `docker stop` and confirm the partial output is gone.
-- If two drives are available: rip a BluRay and an audio CD at the same time.
+- If two drives are available: rip a BluRay and an audio CD at the same time without configuring
+  `RIPPER_DRIVES`; both must be discovered. Repeat with `RIPPER_MAX_PARALLEL_JOBS=1` and see the second queue.
+- `curl :9091/livez`, `/startupz`, `/healthz` and `/readyz` all return the documented JSON.
 - Scrape `:9091/metrics` and confirm the `ripper_` series. If you run an OTel collector, set
-  `OTEL_EXPORTER_OTLP_ENDPOINT` and confirm traces, metrics and logs arrive.
+  `OTEL_EXPORTER_OTLP_ENDPOINT` and confirm the traces arrive.
 
 Phase done when: CI is green and P4.5 is confirmed.
 
 ---
 
 ## Future (not planned work)
+
+- **OTLP metrics and logs:** change only `internal/telemetry` (C§6.5), or bump go-service-kit once
+  its `obs` supports them. No instrumentation changes are needed.
 
 - Native ioctl backends: `CDROMEJECT`/`CDROM_LOCKDOOR` for eject, and
   `CDROM_DRIVE_STATUS`/`CDROM_DISC_STATUS` for state and audio-vs-data detection. They would replace

@@ -40,9 +40,9 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
 
 | # | Topic | Decision |
 |---|---|---|
-| 1 | Seam / Patchbay | One interface per capability (6 seams: runner, detect, rip, eject, notify, meta). Backends are separate packages. `internal/patchbay` is the only place that selects them. |
+| 1 | Seam / Patchbay | One interface per capability (5 seams: runner, detect, rip, eject, notify). Backends are separate packages, single shared instances. `internal/patchbay` is the only place that selects them. |
 | 2 | Entrypoint | `cmd/ripper/main.go` → `internal/cli` (cobra). Follows [go.dev module layout](https://go.dev/doc/modules/layout). |
-| 3 | Config | **viper only**, confined to `internal/cli`. A clean `RIPPER_*` set of 20 keys (C§1); no legacy names. |
+| 3 | Config | **viper only**, confined to `internal/cli`. A clean `RIPPER_*` set of 21 keys (C§1); no legacy names. |
 | 4 | Service framework | go-service-kit v0.3.0: `lifecycle`, `obs`, `httpapi`, `outbound`. |
 | 5 | Modes | `ripper serve` = engine + API + docs, plus the web UI unless `--headless`. |
 | 6 | Ports | API, UI and docs on `:9090`; admin (`/healthz`, `/readyz`, `/metrics`) on `:9091`. |
@@ -67,21 +67,23 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
 | 25 | Re-rip protection | After any rip attempt the engine waits for the disc to be removed. It never re-rips the same disc. |
 | 26 | Staging | Every rip goes into `<kind>/.staging/…` and is renamed into place on success; staging is cleaned at start. |
 | 27 | Native ioctl backends | Future note only (phases.md "Future"). |
-| 28 | Multiple drives | In scope: `RIPPER_DRIVES` list; one engine (lifecycle worker) per drive, rips run concurrently. One shared MakeMKV scan per tick, one output planner, one serialised notifier. Per-drive status, readiness checks and metric labels. |
-| 29 | Observability | Slot 0 = Prometheus pull (`:9091/metrics`) + JSON logs on stdout; liveness `/healthz` and readiness `/readyz` with documented schemas; a defined metric set, log schema + message catalogue, and spans (C§6). OTLP export of traces, metrics **and logs** when `OTEL_*` is set, implemented in go-service-kit `obs` (P2.0). |
+| 28 | Drives and jobs | **No drive configuration needed.** One MakeMKV scan per tick discovers every drive; each drive gets a watcher (state machine). A newly inserted disc becomes a **job** on a FIFO queue; a worker pool runs the jobs (at most one per drive; `RIPPER_MAX_PARALLEL_JOBS` caps it, 0 = no cap). Drives appear and disappear at runtime. `RIPPER_DRIVES` is only an optional filter. API: `/api/v1/status` (drives) and `/api/v1/jobs`. |
+| 29 | Observability | Slot 0 = Prometheus pull (`:9091/metrics`) + JSON logs on stdout (schema + catalogue). Probes: `/livez` (process), `/startupz` (startup done), `/healthz` (**dependency health**: tools, dirs, MakeMKV registration, scanner, loop), `/readyz` (ready for work: started, ≥1 usable drive, not draining), all with one JSON schema (C§6.1). OTel: exactly go-service-kit's current behaviour (OTLP traces), behind `internal/telemetry` so OTLP metrics and logs can be added later in one place (C§6.5). |
 | 30 | Runtime image | **Distroless** `gcr.io/distroless/cc-debian13` (scratch is impossible: `makemkvcon` is a proprietary glibc binary). One image (amd64 + arm64); no shell, no interpreter, no `RUN` in the final stage. MakeMKV is built from source in a matching `debian:trixie` stage at a pinned version, with a static audio-only ffmpeg. Tools are copied with their library closure. PID 1 is `tini-static`, copied in. `HOME=/config`. |
-| 31 | Audio CDs | **abcde is replaced** by a Go pipeline (`rip/audio`): TOC from `cdparanoia -Q`, MusicBrainz lookup + Cover Art Archive via kit `outbound` (falls back to "Unknown Artist"), `cdparanoia -B` extraction, `flac`/`lame` encoding with tags and cover. `RIPPER_AUDIO_FORMATS=flac,mp3`. |
+| 31 | Audio CDs | **abcde is replaced by cyanrip** (C, LGPL-2.1; better than abcde): AccurateRip v1/v2 + EAC CRC verification, offset correction, pregaps, MusicBrainz tags + cover art, ReplayGain, parallel multi-format encoding (`RIPPER_AUDIO_FORMATS`: flac, mp3, opus, aac, alac). Built from source against the same static ffmpeg as MakeMKV. There is no Go port of abcde ([research](#references)). |
 
 ## 3. Glossary
 
 - **Seam**: the interface for one capability: `runner.Runner`, `detect.Detector`, `rip.Ripper`,
-  `eject.Ejector`, `notify.Notifier`, `meta.Lookup` (C§2.2).
-- **Backend**: one package implementing a seam, e.g. `rip/audio` (C§2.3).
+  `eject.Ejector`, `notify.Notifier` (C§2.2).
+- **Backend**: one package implementing a seam, e.g. `rip/cyanrip` (C§2.3).
 - **Patchbay**: `internal/patchbay`. `Backends(...)` picks the backends; `Spec(...)` assembles the
   HTTP servers, readiness and the `lifecycle.Spec`.
-- **Engine**: `internal/engine`, the detect → rip → finalize → eject → notify loop. It runs as a
-  `lifecycle.Worker`.
-- **Pass**: one iteration of the engine loop (C§3.3).
+- **Engine**: `internal/engine`. It scans every tick, keeps one **watcher** per discovered drive,
+  queues **jobs** and runs them on a worker pool (C§3.3). It is a single `lifecycle.Worker`.
+- **Watcher**: the per-drive state machine (idle → queued → ripping → ejecting → awaiting_removal; unusable).
+- **Job**: one rip of one inserted disc, bound to its drive: queued → running → succeeded/failed/cancelled/skipped.
+- **Scan**: one iteration of the engine loop: discover drives, update watchers, dispatch jobs (C§3.3).
 - **Rip plan**: the ordered rip steps for an (ISO mode, kind) pair (C§3.4).
 - **Drive ID**: the device basename, e.g. `sr0` (C§1.2).
 - **Kind dir**: `BluRay`, `DVD`, `CD` or `DATA` under `RIPPER_OUTPUT_DIR`.
@@ -126,7 +128,7 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
 | Principle | Concretely |
 |---|---|
 | KISS | One binary, one engine loop, one output root, one log stream, a UI with no router. |
-| YAGNI | 20 config keys; no backend switches; no parity harness; no log file; native ioctl deferred. |
+| YAGNI | 21 config keys; no backend switches; no parity harness; no log file; native ioctl deferred. |
 | DRY | One `rip.Ripper` interface and one staging/finalize path for every kind; TS types generated from the Go types; CI calls the tasks. |
 | SOLID | 5 small seams; substitutable backends; new backend = new package + one patchbay line; the engine depends only on seams; patchbay split into `Backends` and `Spec`. |
 | 12-Factor | Env config (+ one flag); logs to stdout; port binding via env; kit `lifecycle` for disposability; admin one-offs (`detect`, `healthcheck`). |
@@ -153,13 +155,13 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
   
   Total grace = 5 + 5 + 15 + 5 margin = **30 s**. Use compose `stop_grace_period: 30s` and
   k8s `terminationGracePeriodSeconds: 30`.
-- **Health** (schemas in C§6.1): Docker `HEALTHCHECK CMD ["ripper","healthcheck"]` checks admin `/healthz`.
-  - k8s liveness probe: `/healthz`.
-  - k8s readiness probe: `/readyz`, with checks `drive:<id>` (device present) and `detector:<id>`
-    (fewer than 5 bad replies in a row), per drive.
+- **Probes** (all on 9091, schemas in C§6.1): Docker `HEALTHCHECK CMD ["ripper","healthcheck"]` checks `/healthz` (dependencies).
+  - k8s `startupProbe`: `/startupz`; `livenessProbe`: `/livez` (process only, so a broken dependency
+    never causes a restart loop);
+  - k8s `readinessProbe`: `/readyz` (started, ≥1 usable drive, not draining).
 - **Metrics**: Prometheus scrapes `:9091/metrics` (ServiceMonitor targets the admin port).
-- **OTLP**: set `OTEL_EXPORTER_OTLP_ENDPOINT` (+ the standard `OTEL_*` variables) to also push traces,
-  metrics and logs to a collector (C§6.5).
+- **OTLP**: set `OTEL_EXPORTER_OTLP_ENDPOINT` (+ the standard `OTEL_*` variables) to export traces
+  (go-service-kit's current behaviour). OTLP metrics and logs are a later, one-package change (C§6.5).
 - Go ≥ 1.25 sets `GOMAXPROCS` from the container's CPU limit automatically.
 
 ## 7. Dependencies
@@ -184,12 +186,12 @@ Two trade-offs are accepted:
 | Tool | Decision | Backend |
 |---|---|---|
 | `makemkvcon` | keep (proprietary) | `detect/makemkv`, `rip/makemkv`, `makemkvkey.Register` |
-| `cdparanoia` | keep (ELF) | `detect/makemkv` (`-Q`), `rip/audio` (`-Q` for the TOC, `-B` to extract) |
-| `flac`, `lame` | keep (ELF) | `rip/audio` (encode + tag + cover) |
+| `cyanrip` | **new**, built from source (ELF) | `rip/cyanrip` (rip + verify + tag + encode) |
+| `cdparanoia` | keep (ELF) | `detect/makemkv` (`-Q`, audio vs data) |
 | `ddrescue` | keep (with a map file) | `rip/ddrescue` |
 | `eject`, `sdparm` | keep (ELF) | `eject/execeject` |
 | `tini-static` | keep (static) | PID 1 |
-| `abcde`, eyeD3 (Python), glyrc, cd-discid, metaflac, wget | **remove** | `rip/audio`, `cdda`, `meta/musicbrainz` |
+| `abcde`, eyeD3 (Python), glyrc, cd-discid, flac/metaflac, lame, wget | **remove** | `rip/cyanrip` |
 | `ccextractor` (closed captions), OpenJDK (BD-J menus) | **remove** | — (MakeMKV rips without them) |
 | curl, grep/sed/cut/date/timeout, useradd, bash, python/flask, phusion, syslog-ng | **remove** | apprise-go, kit, stdlib |
 
@@ -199,7 +201,7 @@ Two trade-offs are accepted:
 
 | Old | New |
 |---|---|
-| `DRIVE` | `RIPPER_DRIVES` (comma-separated list; several drives rip concurrently) |
+| `DRIVE` | none needed: drives are discovered. Optional filter `RIPPER_DRIVES` |
 | `STORAGE_CD/DATA/DVD/BD` | `RIPPER_OUTPUT_DIR` (fixed `CD/ DATA/ DVD/ BluRay/` subdirs; `/out/Ripper` keeps the old layout) |
 | `EJECTENABLED` | `RIPPER_EJECT` |
 | `JUSTMAKEISO` / `ALSOMAKEISO` | `RIPPER_ISO_MODE=only` / `also` |
@@ -234,25 +236,24 @@ Two trade-offs are accepted:
 6. `ddrescue` writes a `.map` file next to the `.iso`, so an interrupted ISO rip can resume.
 7. The ripper is the only thing that ejects (abcde used to eject CDs itself). `RIPPER_EJECT=false` is
    now honoured for CDs.
-8. **Audio CDs no longer use abcde.**
-   - Metadata comes from MusicBrainz instead of gnudb/CDDB; a miss gives `Unknown Artist - Disc <id>`.
-   - The layout is fixed: `CD/<Artist> - <Album>/NN. <Title>.{flac,mp3}` with tags and an embedded
-     cover, plus `cover.jpg`.
-   - Formats are set by `RIPPER_AUDIO_FORMATS` (`flac`, `mp3`). `abcde.conf` is no longer read:
-     no ogg/opus, no custom file-name templates, no playlists, no replaygain.
+8. **Audio CDs are ripped with cyanrip instead of abcde**: AccurateRip-verified, MusicBrainz tags and
+   cover art, ReplayGain, with formats from `RIPPER_AUDIO_FORMATS` (`flac`, `mp3`, `opus`, `aac`, `alac`).
+   It uses cyanrip's own folder and file naming; a disc missing from MusicBrainz gets placeholder names.
+   `abcde.conf` is no longer read.
 9. `ISO_MODE` skips audio CDs, which can't be imaged.
 10. `default.mmcp.xml` is now actually used: from `/config` if present, otherwise the built-in one.
 11. The MakeMKV key is never logged; `~/.MakeMKV` has mode 0700.
 12. JSON logs on stdout with a fixed schema. The UI shows the last 2000 records since the process started.
     Prometheus metrics on `:9091/metrics`; optional OTLP export via the standard `OTEL_*` variables.
-13. The API is `/api/v1/status` and `/api/v1/log`, with OpenAPI at `/openapi.json` and docs at `/docs`.
+13. The API is `/api/v1/status`, `/api/v1/jobs` and `/api/v1/log`, with OpenAPI at `/openapi.json` and docs at `/docs`.
     Admin endpoints are on port 9091.
 14. The web UI is rewritten in React + Ant Design. Basic auth is constant-time, with CSRF protection.
 15. The image is distroless (`cc-debian13`), with no shell: one multi-arch image at
     `ghcr.io/jacaudi/docker-ripper` replaces the `latest`/`manual-latest` pair. MakeMKV is pinned
     and updated through releases. Closed-caption extraction (ccextractor) and BD-J menu support
     (Java) are not included.
-16. Several drives can rip at the same time (`RIPPER_DRIVES`).
+16. Drives are discovered automatically and rip at the same time through a job queue
+    (`RIPPER_MAX_PARALLEL_JOBS` caps it). Health probes: `/livez`, `/startupz`, `/healthz`, `/readyz`.
 
 ## 9. Repository admin (manual)
 
@@ -267,20 +268,26 @@ Two trade-offs are accepted:
 ## 10. Remaining risks
 
 - **apprise-go** is pre-1.0. It sits behind the `Notifier` seam; re-evaluate in phase 2.
-- **OTLP logs/metrics** depend on the go-service-kit change (P2.0); until it ships, only traces go over OTLP.
+- **OTLP logs/metrics** are not exported yet (traces only, as in go-service-kit); adding them is a
+  one-package change (C§6.5).
+- **cyanrip's MusicBrainz-miss behaviour** is assumed to be a non-zero exit (the retry rule); checked in P2.3b.
+- **The ffmpeg component list** for cyanrip is checked with `cyanrip -o help` (P4.1) and real rips (P4.5).
 - **Concurrent MakeMKV instances** (multi-drive) are assumed to work; this is checked at P4.5 with two drives if available.
 - **`makemkvcon reg`** is assumed to write `app_Key` itself; this is checked at P4.5.
 - **DVD/BD data discs** are treated as video until a hardware capture shows a distinguishing signal.
 - **The beta key** is fetched once per start; auto-released MakeMKV bumps and the restart policy cover rotation.
 - **MakeMKV source build in CI** depends on makemkv.com and a GPG keyserver. If it fails, the previous
   image stays published. The audio-only ffmpeg codec set is checked at P4.5 with DTS-HD/TrueHD and LPCM discs.
-- **MusicBrainz coverage** differs from gnudb. Misses fall back to `Unknown Artist`, as abcde `-N` did on a CDDB miss.
+- **MusicBrainz coverage** differs from gnudb. Misses fall back to cyanrip's placeholder names.
 - **Scanner visibility**: copied libraries are visible to Trivy only through the `status.d` fragments
   that `collect-rootfs.sh` writes.
 
 ## References
 
 - go-service-kit: https://github.com/leftathome/go-service-kit
+- cyanrip: https://github.com/cyanreg/cyanrip · audio-ripper research: no Go port of abcde exists; Go
+  libraries considered: go.uploadedlobster.com/musicbrainzws2 (MIT), go.uploadedlobster.com/discid
+  (cgo/LGPL), github.com/b0bbywan/go-disc-cuer (cgo)
 - apprise-go: https://pkg.go.dev/github.com/unraid/apprise-go · https://unraid.net/blog/apprise-go
 - Scalar configuration: https://github.com/scalar/scalar/blob/main/documentation/configuration.md
 - Task: https://taskfile.dev · golangci-lint: https://golangci-lint.run · govulncheck: https://go.dev/doc/security/vuln/
