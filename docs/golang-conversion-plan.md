@@ -1,354 +1,398 @@
 # Go conversion plan
 
-Status: **proposal** · Baseline: `archive` branch (= `main` @ `21c5796`) ·
+Status: **agreed direction, v2** · Baseline: `archive` branch (= `main` @ `21c5796`) ·
 Background: [`.claude/CLAUDE.md`](../.claude/CLAUDE.md)
 
 ## 1. Goal
 
-Replace the bash ripper (`ripper.sh` + init script) and the Python web UI with one
-statically linked Go binary that:
+Replace the bash ripper (`ripper.sh`), the init script and the Python web UI with one
+Go binary, `ripper`, that runs either as a **headless API service** or as **API + web UI**.
 
-- keeps every documented env var, output path, hook script name and hook argument list working;
-- calls the external tools that cannot reasonably be replaced (MakeMKV, abcde, ddrescue)
-  through one seam that tests can plug fakes into;
-- replaces everything else (curl, grep/sed/cut, eject/sdparm, useradd, python/flask) with Go;
-- fixes the known detection and lifecycle bugs listed in CLAUDE.md, each one deliberately
-  and recorded as a deviation.
+- External tools that cannot reasonably be replaced (MakeMKV, abcde, ddrescue) are called
+  through a seam with swappable backends, and tested against fake tool binaries.
+- Everything else (curl, grep/sed/cut, useradd, python/flask, phusion init, syslog-ng)
+  becomes Go or a library.
+- The known bugs (CLAUDE.md, "Known bugs and quirks") are fixed deliberately, and each
+  fix is recorded as a deviation (§8).
 
-Out of scope: multi-drive support, new output formats, a new web UI design, replacing
-abcde's audio pipeline.
+This fork **diverges from upstream permanently**. Breaking changes are allowed when
+they're documented.
 
-## 2. Principles applied
+Out of scope: multi-drive support, new output formats, re-implementing abcde's audio pipeline.
 
-| Principle | What it means here |
+## 2. Decisions log
+
+| # | Topic | Decision |
+|---|---|---|
+| 1 | Seam / Patchbay | One interface per capability; one or more backends per seam, each in its own package. `internal/patchbay` is the only place that selects backends. Swapping one = add a package plus one case (or a config value). |
+| 2 | Entrypoint | `cmd/ripper/main.go` → `internal/cli` (cobra). Follows [go.dev module layout](https://go.dev/doc/modules/layout). |
+| 3 | Config | **viper only** (flags > env > defaults), imported only by `internal/cli`. Unmarshalled into a plain `config.Config` with `Validate()` that joins every error. go-service-kit `config` is not used. |
+| 4 | Service framework | go-service-kit: `lifecycle`, `obs`, `httpapi`, `outbound`. Not `config`, `storekit`, `mcp`. |
+| 5 | Modes | `ripper serve` runs the engine and the API; the web UI is mounted unless `--headless` / `HEADLESS=true`. |
+| 6 | Ports | API (+ UI) on `API_ADDR` default `:9090` (today's port). Admin (`/healthz`, `/readyz`, `/metrics`, opt-in pprof) on `ADMIN_ADDR` default `:9091`. |
+| 7 | Logging | One JSON stream (kit `obs`) to stdout, teed to `LOG_FILE` (default `/config/Ripper.log`). Tool output is logged line by line as records with a `tool` attribute. The UI renders JSON records and shows non-JSON lines raw. |
+| 8 | Shutdown mid-rip | Cancel the tool (SIGTERM to its process group, then kill after `WaitDelay`), delete the partial output dir, don't eject. On restart the disc is still in the drive and is ripped again. |
+| 9 | Backend config | Config keys only for seams with ≥ 2 production backends (`DETECTOR_BACKEND`, `EJECT_BACKEND`). Notifications are on when `APPRISE_URLS` is set. Everything else is fixed in the patchbay. |
+| 10 | Notifications | [apprise-go](https://pkg.go.dev/github.com/unraid/apprise-go) (`github.com/unraid/apprise-go`, BSD-2), configured with `APPRISE_URLS`. Pushover is `pover://USER_KEY@APP_TOKEN`. |
+| 11 | Fixtures | All three sources: synthetic (marked), mined from public reports (marked with source), and captured on your hardware (authoritative). |
+| 12 | `/config/ripper.sh` | **Hard break.** No longer executed; documented in migration notes only. Per-disc hook scripts stay as the `script` rip backend. |
+| 13 | Registry | `ghcr.io/jacaudi/docker-ripper` using `GITHUB_TOKEN`. |
+| 14 | Web env names | **New names only**: `WEB_PATH_PREFIX`, `WEB_USERNAME`, `WEB_PASSWORD`. `PREFIX`/`USER`/`PASS` are ignored. |
+| 15 | Upstream | Diverge permanently. Drop upstream-only workflows (sponsor labelling, issue auto-close). |
+| 16 | Deployment target | Target-agnostic binary. Docker/compose is the documented target (see §4); a Kubernetes example uses a device plugin, `replicas: 1`, `strategy: Recreate`. |
+
+## 3. Principles applied
+
+| Principle | Concretely |
 |---|---|
-| KISS | One binary, one process, one loop. Stdlib first. Two third-party modules at most (`golang.org/x/sync`, later `golang.org/x/sys`). |
-| YAGNI | No plugin system, no config files, no feature flags for old behaviour, no interface without a second implementation (a fake counts). |
-| DRY | One video ripper for DVD and BluRay; one "run tool, tee output to log" helper; one ownership/permission routine. |
-| SOLID | Each package does one job. Interfaces are small (one or two methods) and declared by the package that *uses* them. The hook override is a decorator, so new behaviour doesn't mean editing the rippers. |
-| 12-Factor | Config from env only (`config.Load(getenv)`). Logs go to stdout via `slog`, teed to `/config/Ripper.log` for the UI. Port from env. `SIGTERM` cancels the context, which stops child processes (`exec.Cmd.Cancel` + `WaitDelay`). A fatal error exits non-zero and the restart policy takes over. Same image for dev and prod. |
-| Idiomatic / modern Go | `log/slog`, `context`, `errors.Join`/`%w`, `net/http` method+path patterns, `embed`, `signal.NotifyContext`, `os.Root` for static files, `testing/synctest` for the poll loop, `t.Context()`, table-driven tests, no package-level state. Toolchain: Go ≥ 1.25 (`synctest`), pinned with `go`/`toolchain` in `go.mod`. |
-| Seam | Every side effect sits behind a narrow seam: process execution, drive state, eject, notification, ownership, HTTP. Tests swap the implementation without editing the caller. |
-| Patchbay | `cmd/ripper/main.go` is the only place that builds concrete implementations and connects them. Packages receive collaborators and never construct their own. Moving to a native implementation (e.g. ioctl eject) is a one-line change in the patchbay. |
+| KISS | One binary, one process, one engine loop. No plugin system, no config files beyond what viper gives for free. |
+| YAGNI | No config key for a seam with one backend. No API endpoint without a consumer (§6.3). No native backend until hardware tests exist for it. |
+| DRY | One `rip.Ripper` interface for every disc kind; the patchbay maps kinds to backends. One process runner. One output/permissions routine. One log stream. |
+| SOLID | Seams are 1–2 method interfaces (ISP). Backends are substitutable (LSP). Adding a backend needs no change to the engine (OCP). The engine depends on seam interfaces only (DIP). |
+| 12-Factor | Config from env (+flags); JSON logs to stdout; port binding via `API_ADDR`/`ADMIN_ADDR`; disposability via kit `lifecycle`; same image in dev and prod. One-off admin processes are cobra subcommands (`detect`, `healthcheck`). |
+| Modern / idiomatic Go | Go 1.26 (the kit requires it). `log/slog`, `context` everywhere, `errors.Join`, `exec.Cmd.Cancel` + `WaitDelay`, `embed`, `testing/synctest`, `t.Context()`, table-driven tests. Lint config and Makefile gates copied from go-service-kit. |
 
-Seams we deliberately **don't** add (YAGNI): a filesystem abstraction (tests use
-`t.TempDir()`), a clock interface (`testing/synctest` virtualises time), a config interface.
+## 4. Deployment and runtime
 
-## 3. Dependency decisions
+Industry practice for a drive-bound worker is **one instance, pinned to the host that
+owns the drive**.
+- On Docker this means `--device /dev/srN --device /dev/sgN`.
+- On Kubernetes the recommended pattern is a device-plugin DaemonSet rather than a
+  privileged workload pod ([generic-device-plugin](https://github.com/squat/generic-device-plugin/issues/62),
+  [Talos guide](https://docs.siderolabs.com/kubernetes-guides/advanced-guides/device-plugins.md)).
 
-| Today | Decision | Seam | Rationale |
-|---|---|---|---|
-| `makemkvcon` (detect, rip, reg) | **Keep, exec** | `proc.Runner` | Proprietary; it is the decryption engine. |
-| `abcde` + cdparanoia/lame/flac/eyeD3/metaflac/glyrc | **Keep, exec** | `proc.Runner` | Users customise `abcde.conf`; re-implementing CDDB, ripping, encoding and tagging is a project of its own. |
-| `ddrescue` | **Keep, exec** | `proc.Runner` | Its bad-sector retry map is why it's used. |
-| `cdparanoia -Q` (audio fallback) | Exec in phase 3 → **native** in phase 6 | `Detector` | `CDROM_DISC_STATUS` ioctl tells audio from data directly. |
-| `eject`, `sdparm` | Exec in phase 3 → **native** in phase 6 | `Ejector` | `CDROMEJECT` / `CDROM_LOCKDOOR` ioctls (`x/sys/unix`). |
-| `curl` → Pushover | **Replace** | `Notifier` | `net/http` POST form. |
-| `curl` + `grep -P` → beta key scrape | **Replace** | none (plain func taking `*http.Client`) | `net/http` + `regexp`. |
-| `grep/sed/cut/date/timeout` | **Replace** | — | stdlib; `context.WithTimeout` replaces `timeout 30s`. |
-| `sed -i OUTPUTDIR=` in abcde.conf | **Replace** | — | Write a generated conf into a temp dir (see §6.4); stop editing files in the image. |
-| `useradd` / `groupadd` | **Remove** | `Owner` (func) | Resolve names with `os/user`; fall back to `FILEUSERID`/`FILEGROUPID`; `os.Chown` takes numbers. |
-| `chmod -R g+rw` | **Replace** | — | Small symbolic-mode parser (`[ugoa]*[+-=][rwxX]*`, comma-separated) + `filepath.WalkDir`. |
-| python3, flask, waitress, docopt | **Replace** | — | `net/http` + `embed`; same routes and JSON. |
-| phusion `my_init`, syslog-ng | **Remove** | — | Single Go process under `tini` (`ENTRYPOINT ["tini","--","ripper"]`). |
-| ccextractor, OpenJDK | **Keep in image** | — | MakeMKV uses them. |
+Docker sends SIGTERM to PID 1 and kills it after a grace period (10 s by default), so:
 
-## 4. Target layout
+- run under an init that forwards signals: `ENTRYPOINT ["tini","--","ripper"]`, `CMD ["serve"]`;
+- set `lifecycle.Spec.PropagationDelay = NoPropagationDelay` (single replica + Recreate,
+  exactly the case the kit documents), `DrainTimeout` ~5 s, and the engine worker
+  `FinishCurrentCycle: true` with a short `StopTimeout` (~15 s), enough to cancel the
+  tool and delete partial output;
+- compose `stop_grace_period` and k8s `terminationGracePeriodSeconds` come from
+  `Spec.TerminationGracePeriodSeconds()` (5 s drain + 5 s flush + 15 s worker + 5 s margin = 30 s);
+- Docker `HEALTHCHECK CMD ["ripper","healthcheck"]` probes the admin `/healthz`, so the
+  image needs no curl.
+
+## 5. Dependencies
+
+### 5.1 Go modules
+
+| Module | Why | Notes |
+|---|---|---|
+| `github.com/spf13/cobra` | commands, flags | only in `internal/cli` |
+| `github.com/spf13/viper` | config resolution | only in `internal/cli` |
+| `github.com/leftathome/go-service-kit` | lifecycle, obs, httpapi (huma), outbound | pin a tag (v0.3.0+) |
+| `github.com/unraid/apprise-go` | notifications | pre-1.0: pin exactly; `Send` takes no `context` and no custom HTTP client, so the backend wraps it with a timeout. It bypasses kit `outbound` (accepted, documented). |
+| `golang.org/x/sys/unix` | ioctl backends | phase 6 only |
+
+### 5.2 External tools
+
+| Tool | Decision | Seam / backend |
+|---|---|---|
+| `makemkvcon` (detect, rip, reg) | keep, exec | `detect/makemkv`, `rip/makemkv`, `mkvkey` registration |
+| `abcde` + cdparanoia/lame/flac/eyeD3/metaflac/glyrc | keep, exec | `rip/abcde` |
+| `ddrescue` | keep, exec | `rip/ddrescue` |
+| user hook scripts (`BLURAYrip.sh`, `DVDrip.sh`, `CDrip.sh`, `DATArip.sh`) | keep, exec | `rip/script` (same names, `+x` requirement and arguments as today) |
+| `cdparanoia -Q` | exec now → ioctl later | inside `detect/makemkv` → `detect/native` |
+| `eject`, `sdparm` | exec now → ioctl later | `eject/exec` → `eject/ioctl` |
+| `curl` (Pushover) | replace | `notify/apprise` |
+| `curl` + `grep -P` (beta key) | replace | `mkvkey/forum` using kit `outbound` |
+| `grep/sed/cut/date/timeout`, `useradd/groupadd`, `chmod g+rw` | replace | stdlib; numeric `os.Chown`; small symbolic-mode parser |
+| python/flask/waitress/docopt | replace | `internal/api` (huma) + `internal/webui` (embed) |
+| phusion `my_init`, syslog-ng | remove | kit `lifecycle` + `obs`, tini |
+
+## 6. Architecture
+
+### 6.1 Layout
 
 ```
-go.mod                         module github.com/jacaudi/docker-ripper
-cmd/ripper/main.go             patchbay: load config, build implementations, connect them, run
-internal/config/               Config struct, Load(getenv) (Config, error), validation
-internal/disc/                 pure domain: Kind, Disc, ParseDRV(out, device) — no I/O
-internal/proc/                 Runner seam + Exec impl (os/exec, context cancel, tee to log)
-internal/makemkv/              Detector (info disc:9999 → disc.Disc), video Ripper, key + registration
-internal/rip/                  Audio (abcde), ISO (ddrescue), Hook decorator, Placer (dir naming/finish/perm)
-internal/drive/                Ejector: exec impl (phase 3), ioctl impl (phase 6)
-internal/notify/               Pushover Notifier, Nop
-internal/perm/                 symbolic mode parser, recursive chown/chmod
-internal/ripper/               Loop: the poll/rip/eject state machine; consumer-side interfaces
-internal/web/                  http.Handler for UI + /api/log/, embedded static assets
-internal/testutil/fakebin/     fake external tools for integration and parity tests (see §7)
-test/parity/                   legacy-vs-Go parity harness (see §7.3)
-latest/Dockerfile, manual-build/Dockerfile   multi-stage: build Go, then the runtime image
+cmd/ripper/main.go            entrypoint: os.Exit(cli.Execute(ctx))
+internal/cli/                 cobra commands + viper binding (only importer of cobra/viper)
+  root.go serve.go detect.go healthcheck.go version.go
+internal/config/              Config struct, defaults, Validate() — no viper import
+internal/patchbay/            selects a backend per seam from Config; builds the lifecycle.Spec
+internal/disc/                domain: Kind, Disc, ParseDRV (pure)
+internal/engine/              poll → detect → rip → finalize → eject → notify; a lifecycle.Worker
+internal/output/              dir naming, label sanitising, finished/ move, chown/chmod, partial cleanup
+internal/api/                 huma operations (status, log)
+internal/webui/               embedded static UI (mounted unless headless)
+
+seams (interface only)        backends (one package each)
+internal/runner/              runner/exec            (fake in tests)
+internal/detect/              detect/makemkv          detect/native (phase 6)
+internal/rip/                 rip/makemkv  rip/abcde  rip/ddrescue  rip/script
+internal/eject/               eject/exec              eject/ioctl (phase 6)
+internal/notify/              notify/apprise          notify/nop
+internal/mkvkey/              mkvkey/env              mkvkey/forum
+
+internal/testutil/fakebin/    fake external tools for integration + parity tests
+test/parity/                  legacy-vs-Go parity harness
 ```
 
-Interfaces live where they are consumed (`internal/ripper` declares `Detector`,
-`Ripper`, `Ejector`, `Notifier`); implementations return concrete structs.
-
-### 4.1 Core types and seams (sketch)
+### 6.2 Seams
 
 ```go
-// internal/disc
-type Kind int
-const (Unknown Kind = iota; Empty; Open; Loading; BluRay; DVD; AudioCD; Data)
-type Disc struct {
-    Kind   Kind
-    Index  int    // makemkv drive index (any number of digits)
-    Label  string // sanitised for use as a directory name
-    Device string
-}
-func ParseDRV(out []byte, device string) (Disc, error) // pure, deterministic, ordered rules
-
-// internal/proc
+// internal/runner
 type Cmd struct {
-    Name   string
-    Args   []string
-    Stdout io.Writer // nil = log sink
+    Name string
+    Args []string
+    Tool string // log attribute; each output line becomes a slog record
 }
-type Runner interface{ Run(ctx context.Context, c Cmd) error }
+type Runner interface {
+    Run(ctx context.Context, c Cmd) error
+    Output(ctx context.Context, c Cmd) ([]byte, error)
+}
 
-// internal/ripper (consumer-side seams)
+// internal/detect
 type Detector interface{ Detect(ctx context.Context) (disc.Disc, error) }
-type Ripper   interface{ Rip(ctx context.Context, d disc.Disc) error }
-type Ejector  interface{ Eject(ctx context.Context) error }
-type Notifier interface{ Notify(ctx context.Context, msg string) error }
 
-type Loop struct {
-    Detect   Detector
-    Rippers  map[disc.Kind]Ripper // BluRay, DVD → makemkv; AudioCD → abcde; Data → ISO
-    ISO      Ripper               // JUSTMAKEISO / ALSOMAKEISO
-    Eject    Ejector
-    Notify   Notifier
-    Interval time.Duration
-    BadLimit int
-    Mode     Mode // Normal | JustISO | AlsoISO
-    EjectOn  bool
-    Log      *slog.Logger
+// internal/rip  — one interface for every disc kind (DRY)
+type Result struct{ Dir string } // what to finalize, or clean up on cancel
+type Ripper interface{ Rip(ctx context.Context, d disc.Disc) (Result, error) }
+
+// internal/eject
+type Ejector interface{ Eject(ctx context.Context) error }
+
+// internal/notify
+type Event struct {
+    Kind  Kind // Success | Failure | Stopped
+    Title string
+    Body  string
 }
-func (l *Loop) Run(ctx context.Context) error  // ticks every Interval until ctx done or BadLimit hit
-func (l *Loop) Step(ctx context.Context) error // one detect→rip→eject→notify pass (unit-tested)
+type Notifier interface{ Notify(ctx context.Context, e Event) error }
+
+// internal/mkvkey
+type Source interface{ Key(ctx context.Context) (string, error) }
 ```
 
-### 4.2 Patchbay (sketch)
+`runner/exec` uses `exec.CommandContext` with `SysProcAttr.Setpgid`, a `Cancel` that sends
+SIGTERM to the process group (abcde forks encoders), and `WaitDelay` before SIGKILL.
+
+### 6.3 Patchbay
 
 ```go
-func main() {
-    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-    defer stop()
-    if err := run(ctx, os.Getenv, os.Stdout); err != nil {
-        slog.Error("ripper stopped", "err", err)
-        os.Exit(1)
-    }
-}
+// internal/patchbay — the only place that knows concrete backends.
+func Build(ctx context.Context, cfg config.Config, p *obs.Providers) (lifecycle.Spec, error) {
+    run := execrunner.New(p.Logger)
 
-// run is the patchbay: the only place where concrete implementations are created and wired.
-func run(ctx context.Context, getenv func(string) string, stdout io.Writer) error {
-    cfg, err := config.Load(getenv)
+    det, err := newDetector(cfg, run) // switch cfg.DetectorBackend { "makemkv", "native" }
     if err != nil {
-        return err
+        return lifecycle.Spec{}, err
     }
-    logFile, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-    // ... sink := io.MultiWriter(stdout, logFile); logger := slog.New(slog.NewTextHandler(sink, ...))
-    sh := proc.Exec{Log: sink}
-    place := rip.Placer{Timestamp: cfg.TimestampPrefix, SeparateFinish: cfg.SeparateRawFinish, Perm: perm.New(cfg.Owner, cfg.Mode)}
-    video := rip.Hook{Script: cfg.Hook("BLURAYrip.sh"), Run: sh, Next: makemkv.Ripper{Run: sh, Root: cfg.StorageBD, ...}}
-    // ... audio, iso, dvd built the same way
-    loop := &ripper.Loop{Detect: makemkv.Detector{Run: sh, Device: cfg.Drive}, ...}
+    ej, err := newEjector(cfg, run) // switch cfg.EjectBackend { "exec", "ioctl" }
+    if err != nil {
+        return lifecycle.Spec{}, err
+    }
 
-    if err := makemkv.Register(ctx, sh, http.DefaultClient, cfg.Key, cfg.Home); err != nil {
-        return err
+    rippers := map[disc.Kind]rip.Ripper{
+        disc.BluRay:  withHook(cfg, "BLURAYrip.sh", run, makemkv.New(run, cfg.StorageBD, cfg.MinLength)),
+        disc.DVD:     withHook(cfg, "DVDrip.sh", run, makemkv.New(run, cfg.StorageDVD, cfg.MinLength)),
+        disc.AudioCD: withHook(cfg, "CDrip.sh", run, abcde.New(run, cfg.Drive, cfg.AbcdeConf)),
+        disc.Data:    withHook(cfg, "DATArip.sh", run, ddrescue.New(run, cfg.Drive, cfg.StorageData)),
     }
-    g, ctx := errgroup.WithContext(ctx)
-    g.Go(func() error { return loop.Run(ctx) })
-    g.Go(func() error { return web.Serve(ctx, cfg.Web, cfg.LogFile) })
-    return g.Wait()
+
+    eng := engine.New(engine.Deps{
+        Detect: det, Rippers: rippers, Eject: ej, Notify: newNotifier(cfg), Output: output.New(cfg),
+    }, cfg.Engine)
+
+    api := httpapi.New(httpapi.Options{Addr: cfg.APIAddr, Middleware: basicAuth(cfg) /* , ... */})
+    apiroutes.Register(api.Huma, eng, cfg.LogFile)
+    if !cfg.Headless {
+        webui.Mount(api, cfg.WebPathPrefix)
+    }
+    admin := httpapi.NewAdmin(httpapi.AdminOptions{Addr: cfg.AdminAddr, Registry: p.PromRegistry})
+
+    return lifecycle.Spec{
+        Servers:          []*http.Server{api.Server, admin.Server},
+        PropagationDelay: lifecycle.NoPropagationDelay, // single replica + Recreate: nothing else serves
+        Flush:            p.Shutdown,
+        Workers: []lifecycle.Worker{{
+            Name: "engine", Run: eng.Run, FinishCurrentCycle: true, StopTimeout: 15 * time.Second,
+        }},
+    }, nil
 }
 ```
 
-`run` takes `getenv` and `stdout`, so the whole binary can be exercised in-process by
-tests with a fake environment and fakebin on `PATH`.
+`withHook` returns the `rip/script` backend when `/config/<name>` exists and is executable,
+and the default backend otherwise. Each swap is visible in exactly one function.
 
-## 5. Behaviour: kept vs. intentionally changed
+### 6.4 Commands
 
-Kept (contract): every env var and default in CLAUDE.md; output directory layout;
-`TIMESTAMPPREFIX` format `YYYYMMDD_HHMMSS_`; `finished/` layout; hook names, executable
-requirement, argument order; `/config/Ripper.log` and the `/api/log/` JSON shape;
-`PREFIX`/`USER`/`PASS` web settings; MakeMKV command lines; abcde command line; 60 s poll.
+| Command | Purpose |
+|---|---|
+| `ripper serve [--headless]` | Default container command. Startup work (§7 phase 4), then `lifecycle.Run(patchbay.Build(...))`. |
+| `ripper detect [--raw]` | One-off: print the detected disc, or with `--raw` the unparsed tool output (fixture capture). |
+| `ripper healthcheck` | GET admin `/healthz`, exit 0/1 (Docker `HEALTHCHECK`). |
+| `ripper version` | Build info (ldflags), also exported by `obs` as `service_build_info`. |
 
-Intentional deviations (each gets a parity-test override and a CHANGELOG line):
+### 6.5 HTTP surface
+
+The public listener (`API_ADDR`) uses huma, so the OpenAPI spec is generated and its docs
+UI is on by default. Basic auth via `httpapi.Options.Middleware` when `WEB_USERNAME` and
+`WEB_PASSWORD` are both set (constant-time compare).
+
+| Route | Purpose |
+|---|---|
+| `GET /api/v1/status` | Engine state (`idle`, `detecting`, `ripping`, `waiting_for_eject`), current disc, started-at, last result. The minimum a headless consumer needs. |
+| `GET /api/v1/log?lines=N` | Last N records, newest first, plus file size and a `large` flag. |
+| `DELETE /api/v1/log` | Truncate the log file. |
+| `GET /` … | Web UI (only when not headless), embedded, served via `RawRoute("GET /…")`. |
+
+Admin listener (`ADMIN_ADDR`): kit-provided `/healthz`, `/readyz` (registered check: drive
+device present), `/metrics`, pprof when `PPROF_ENABLED=true`. Candidates **not** in scope
+until a consumer needs them: `POST /api/v1/eject`, `POST /api/v1/rescan`.
+
+## 7. Phases
+
+Each phase is one PR: CI green, reviewed, merged before the next starts. Phases 1–4 add Go
+code and tests only. The shipped image stays on bash/python until phase 5 cuts it over.
+
+### Phase 0 — Safety net
+- ✔ `archive` branch; ✔ `.claude/CLAUDE.md`. Protecting `archive` is a manual setting (§10).
+- Fixtures under `internal/disc/testdata/`, with a `source` field on each one:
+  1. synthetic, built from MakeMKV's robot format;
+  2. mined from public upstream issues and forum posts (source URL recorded);
+  3. captured on your hardware with `scripts/capture-fixtures.sh` (runs in the legacy image) — authoritative.
+  Cases: empty, open, loading, DVD, BD, UHD, audio CD, data CD, data DVD, blank label, garbage.
+- `internal/testutil/fakebin` and the `test/parity` harness, running the **legacy** script only (§9.3).
+- Tooling copied from go-service-kit: `Makefile` (`lint`, `test`, `vulncheck`, retried tool
+  installs), `.golangci.yml`, `renovate.json`. `ci.yml` runs shellcheck + the parity suite.
+
+Exit: the parity suite passes against the legacy script for every scenario.
+
+### Phase 1 — Skeleton that boots
+- `go.mod` (Go 1.26), `cmd/ripper`, `internal/cli` (root, `version`, `healthcheck`),
+  `internal/config` (+ viper binding, defaults, `Validate`), `obs.Setup`, `lifecycle.Run`
+  with the admin listener only.
+- `internal/disc` (`ParseDRV` + fixture tests), `internal/output` (mode parser, naming, sanitising).
+- CI: `make lint test vulncheck` (race, shuffle).
+
+Exit: `ripper serve` starts, answers `/healthz`, shuts down cleanly on SIGTERM.
+
+### Phase 2 — HTTP surface
+- `internal/api` (status, log), `internal/webui` (existing assets ported to read JSON
+  records; petite-vue kept), `--headless`, basic-auth middleware, `WEB_PATH_PREFIX`.
+- Risk to verify early: path prefix with huma plus otelhttp route labels. Fallback: register
+  operations with the prefix rather than wrapping the handler in `StripPrefix`.
+
+Exit: `httptest` coverage of every route, in both modes, with and without auth and prefix.
+
+### Phase 3 — Engine and backends (exec)
+- `runner/exec`, `detect/makemkv`, `rip/{makemkv,abcde,ddrescue,script}`, `eject/exec`,
+  `notify/{apprise,nop}`, `output`, `engine`, `patchbay`.
+- Engine tests use `testing/synctest` (60 s poll, 5 s manual-eject wait) with
+  `lifecycle.Spec.Signals` set to an empty slice, as the kit requires inside a bubble.
+- The parity harness now runs legacy **and** Go.
+
+Exit: parity passes (modulo §8); every engine branch unit-tested, including cancel-mid-rip cleanup.
+
+### Phase 4 — Startup work (replaces `/etc/my_init.d/ripper.sh`)
+- `mkvkey/env`, `mkvkey/forum` (kit `outbound`, polite rate limit, ToS comment at the
+  construction site), `settings.conf` update that touches only `app_Key`, `makemkvcon reg`.
+- abcde config: use `/config/abcde.conf` untouched if it exists; otherwise render the
+  bundled default with `OUTPUTDIR=$STORAGE_CD` into a temp file.
+- Ownership via `output` (numeric chown, no `useradd`).
+
+Exit: tests with an `httptest` forum page and fakebin `makemkvcon`.
+
+### Phase 5 — Image cutover
+- Multi-stage Dockerfiles: `golang:1.26` builds `CGO_ENABLED=0`; the runtime is `ubuntu:noble`
+  + kept tools + `tini`. The manual build keeps its MakeMKV-from-source stage.
+- Delete `root/etc/my_init.d`, `root/etc/syslog-ng`, `root/web`, `root/ripper/ripper.sh`,
+  `root/ripper/settings.conf`, python, phusion.
+- Workflows: publish to `ghcr.io/jacaudi/docker-ripper` (multi-arch as today); fix the
+  base-image watcher (`noble`); delete `IssueModerator.yml` and `LabelSponsors.yml`;
+  `ci.yml` becomes a required check.
+- README rewrite plus migration notes (§8); compose with `init: true`, `stop_grace_period`,
+  `HEALTHCHECK`; k8s example manifest.
+
+Exit: CI smoke test of the image against a fakebin drive; one real rip per disc type on your hardware.
+
+### Phase 6 — Native backends (optional, one PR each, hardware-gated)
+- `eject/ioctl` (`CDROM_LOCKDOOR` 0 + `CDROMEJECT`).
+- `detect/native`: `CDROM_DRIVE_STATUS` / `CDROM_DISC_STATUS` for empty/open/loading and
+  audio vs data, with MakeMKV still the source of truth for DVD vs BD and the label.
+- Selected with `EJECT_BACKEND` / `DETECTOR_BACKEND`. The exec backend is deleted once the
+  native one has proven itself (YAGNI).
+
+## 8. Behaviour changes (migration notes)
 
 | # | Old | New |
 |---|---|---|
-| D1 | Pattern map with undefined order; `cd2` matches empty drives | Ordered rules on parsed fields: state first, then media flags. Empty label ≠ CD. |
-| D2 | Data CDs/DVDs go to abcde/MakeMKV | Data discs routed to the ISO ripper. CD: no audio tracks per `cdparanoia -Q` (later the `CDROM_DISC_STATUS` ioctl). DVD/BD: the exact signal is confirmed against captured fixtures (Q1). |
-| D3 | Unrecognised reply below threshold → "rip" branch → eject | Counts as bad, logs, waits. No rip, no eject. |
-| D4 | `cut -c5` drive index | Parsed integer. |
-| D5 | `--profile=/config/default.mmcp.xml` (never exists) | Use `/config/default.mmcp.xml` if present, else the bundled `/ripper/default.mmcp.xml`. |
-| D6 | `ALSOMAKEISO` on a CD after abcde already ejected | Make the ISO **before** abcde runs for CDs. |
-| D7 | Empty/unsafe label used raw | Sanitise; empty label → `disc_<timestamp>`. |
-| D8 | Bad-threshold exit leaves web UI running, ripper dead | Process exits non-zero; the container restart policy restarts it (`restart: unless-stopped` added to compose). |
-| D9 | MakeMKV key printed in logs | Logged as redacted (`T-…<last 4>`). `~/.MakeMKV` mode `0700`, not `777`. |
-| D10 | Pushover fires on fatal path with "finished" text | Notifies on success ("Ripped <label>") and on fatal stop ("Ripper stopped: …"); empty tokens = disabled. |
-| D11 | Basic auth non-constant-time, realm "FeedCrawler" | `subtle.ConstantTimeCompare`, realm "Ripper". |
-| D12 | `/config/ripper.sh` is user-editable and runs | No longer executed. Hooks are the extension point. If `/config/ripper.sh` exists, log a one-time warning naming the hooks. (See open question Q2.) |
-| D13 | Users/groups created with `useradd` | Numeric `chown`; names resolved if they exist, otherwise `FILEUSERID`/`FILEGROUPID`. |
+| D1 | Pattern map with undefined order; `cd2` matches empty drives | Ordered rules on parsed fields; an empty label never implies CD |
+| D2 | Data CDs/DVDs sent to abcde/MakeMKV | Routed to the ISO backend (exact DVD/BD signal confirmed with fixtures) |
+| D3 | Unrecognised reply below threshold → "rip" branch → eject | Counted as bad; no rip, no eject |
+| D4 | `cut -c5` drive index | Parsed integer |
+| D5 | `--profile=/config/default.mmcp.xml` (never exists) | `/config/default.mmcp.xml` if present, else the bundled profile |
+| D6 | `ALSOMAKEISO` on a CD after abcde has ejected it | ISO made before abcde for CDs |
+| D7 | Raw/empty labels used as directory names | Sanitised; empty → `disc_<timestamp>` |
+| D8 | Bad-threshold exit leaves a dead ripper and a live UI | Engine error → kit `lifecycle` shuts the process down → restart policy |
+| D9 | MakeMKV key printed; `~/.MakeMKV` mode 777 | Key logged redacted; mode 0700 |
+| D10 | Pushover via `POVER_APP_TOKEN`/`POVER_USER_KEY`, fixed text | `APPRISE_URLS` (e.g. `pover://USER_KEY@APP_TOKEN`); success/failure/stopped events |
+| D11 | Basic auth realm "FeedCrawler", non-constant-time | Constant-time, realm "Ripper" |
+| D12 | `/config/ripper.sh` executed | Ignored (hard break); hook scripts remain |
+| D13 | `useradd`/`groupadd` at start | Numeric chown; names resolved if present, else `FILEUSERID`/`FILEGROUPID` |
+| D14 | `PREFIX`/`USER`/`PASS` | `WEB_PATH_PREFIX`/`WEB_USERNAME`/`WEB_PASSWORD` only |
+| D15 | Plain-text `Ripper.log`, tool output raw | JSON records; tool output one record per line |
+| D16 | `/api/log/` | `/api/v1/log`, `/api/v1/status`; OpenAPI docs |
+| D17 | One port (9090) | API/UI `:9090`, admin `:9091` |
+| D18 | `docker stop` kills a rip, leaving partial output | Rip cancelled cleanly, partial output removed |
+| D19 | phusion base, python, syslog-ng in image | `ubuntu:noble` + tools + tini + `ripper` |
 
-## 6. Phases
+Core ripper env names (`DRIVE`, `STORAGE_*`, `EJECTENABLED`, `JUSTMAKEISO`, …) are kept unchanged.
 
-Each phase is one PR, CI-green, reviewed, merged before the next starts. The image
-stays shippable after every phase. Bash/Python are deleted only in phase 5.
+## 9. Testing external tools
 
-### Phase 0 — Safety net (no Go in the image yet)
+### 9.1 Unit
+A fake `runner.Runner` records each `Cmd` and returns canned output from fixtures. Each
+backend is tested through its seam interface, so a new backend reuses the same table of cases.
 
-- `archive` branch, protected. ✔ (protection is a manual GitHub setting, see §9)
-- `.claude/CLAUDE.md`. ✔
-- **Fixtures**: commit real `makemkvcon -r --cache=1 info disc:9999` and `cdparanoia -Q`
-  output for: empty, open, loading, DVD, BD, UHD, audio CD, data CD, data DVD, blank
-  label, unexpected/garbage. Store as `internal/disc/testdata/<case>.txt`.
-  Needs a real drive (see Q1); `scripts/capture-fixtures.sh` makes it one command.
-- `internal/testutil/fakebin` + `test/parity` harness running the **legacy** script
-  against fixtures (§7). This pins down today's behaviour before any Go replaces it.
-- CI workflow `ci.yml`: `shellcheck`, then parity suite (legacy only).
+### 9.2 Integration — `fakebin`
+A small Go program, built once in `TestMain` and symlinked as `makemkvcon`, `abcde`,
+`ddrescue`, `cdparanoia`, `eject`, `sdparm` (and `curl` for the legacy run). It is driven by
+a scenario directory (`FAKEBIN_DIR`):
+- appends `{"tool","args"}` to `calls.jsonl`;
+- prints `<tool>.stdout` and exits with `<tool>.exit`;
+- simulates side effects (MKV/ISO/FLAC files written into the output directory);
+- with `<tool>.block`, blocks until signalled, to test cancel-mid-rip cleanup.
 
-Exit: parity harness green against the legacy script for every fixture scenario.
+Hook scripts are tested with real tiny shell scripts in `testdata/hooks/`.
 
-### Phase 1 — Skeleton and pure core
+### 9.3 Parity — legacy vs Go
+Every scenario runs twice in a throwaway container (root, real `/config`, `/out`):
+1. the legacy `ripper.sh`, vendored read-only from `archive`, with fakebin on `PATH` and a
+   fake `sleep` that ends the loop after N iterations;
+2. `ripper serve`, with the same fakebin.
 
-- `go.mod`, `cmd/ripper` (patchbay that only loads config and logs it), `internal/config`,
-  `internal/disc` (`ParseDRV` + tests from fixtures), `internal/perm` (mode parser + tests),
-  `internal/proc` (`Exec` + tests with fakebin).
-- CI: `gofmt -l`, `go vet`, `staticcheck`, `go test -race ./...`, `govulncheck`.
+The harness compares the normalised tool-call log and the resulting `/out` tree (paths,
+modes, owners). A legacy `curl` to Pushover and a Go apprise call to a local fake server both
+normalise to a `notify` event. Expected differences are declared per scenario and keyed to
+§8, so every deviation is explicit and reviewed.
 
-Exit: ≥90 % coverage on `disc`, `config`, `perm`; CI green.
-
-### Phase 2 — Web UI port
-
-- `internal/web`: same routes, `embed` the existing static assets unchanged (drop the
-  `{% raw %}` wrapper), `os.Root` for static file serving, efficient tail (seek from end
-  in byte mode), `PORT` env with default `9090`.
-- Ship it first: the Dockerfile runs `ripper web` instead of `web.py` (the only
-  subcommand we add, and it gets removed again in phase 5). Python stays for nothing else.
-
-Exit: `httptest` suite covers GET/DELETE/auth/prefix/redirect; manual check in the image.
-
-### Phase 3 — Ripper loop (exec everywhere)
-
-- `makemkv.Detector`, `makemkv.Ripper`, `rip.Audio`, `rip.ISO`, `rip.Hook`, `rip.Placer`,
-  `drive.ExecEjector` (eject → sdparm fallback), `notify.Pushover`, `ripper.Loop`.
-- Loop tests use `testing/synctest` for the 60 s interval and 5 s manual-eject poll, so
-  they run instantly.
-- Parity harness now runs **both** legacy and Go for every scenario (§7.3).
-
-Exit: parity green (modulo D1–D13), all loop branches unit-tested.
-
-### Phase 4 — Startup work (replaces `/etc/my_init.d/ripper.sh`)
-
-- `makemkv.FetchBetaKey`, `makemkv.EnsureSettings` (only touches `app_Key`, keeps other
-  lines such as `app_ccextractor`), `makemkv.Register` (exec `makemkvcon reg <key>`).
-- abcde config: if `/config/abcde.conf` exists use it untouched (today's precedence);
-  otherwise render the bundled default with `OUTPUTDIR=$STORAGE_CD` into a temp file.
-- Ownership via `perm` (no `useradd`).
-
-Exit: tests with `httptest` forum page + fakebin `makemkvcon`.
-
-### Phase 5 — Cut over the image
-
-- Multi-stage Dockerfiles: `golang:<pinned>` builds `CGO_ENABLED=0` → runtime stage
-  `ubuntu:noble` + tools + `tini`; `ENTRYPOINT ["tini","--","ripper"]`. Manual build keeps
-  its MakeMKV-from-source stage.
-- Remove `root/etc/my_init.d`, `root/etc/syslog-ng`, `root/web/web.py`, `root/ripper/ripper.sh`,
-  `root/ripper/settings.conf`, python packages, `curl`/`wget`/`git` if unused, phusion base.
-- Fix workflows: base-image watcher, registry (Q3), Go CI as required check.
-- README: migration notes (D1–D13), hooks as the extension point.
-
-Exit: image smoke test in CI (`docker run … ripper` against fakebin drive scenario);
-manual rip of one disc per type on real hardware (Q1).
-
-### Phase 6 — Native replacements (optional, one PR each, hardware-verified)
-
-- `drive.IoctlEjector` (`CDROM_LOCKDOOR` 0 + `CDROMEJECT`) → swap in patchbay, delete exec ejector, drop `eject`/`sdparm` packages.
-- Native state/media check (`CDROM_DRIVE_STATUS`, `CDROM_DISC_STATUS`) → replaces
-  `cdparanoia -Q` and handles empty/open/loading without calling MakeMKV. MakeMKV stays the
-  source of truth for DVD vs BD and for the disc label.
-- Each lands only after a `//go:build hardware` test passes on a real drive.
-
-## 7. Testing external tools
-
-Four layers, cheapest first. All but layer 4 run in CI without a drive.
-
-### 7.1 Unit — in-memory fakes
-
-A `fakeRunner` records every `proc.Cmd` and returns canned stdout/exit codes from
-fixtures. Covers argument construction, branching, error handling. `ParseDRV` is pure
-and table-tested directly against `testdata/*.txt`.
-
-### 7.2 Integration — `fakebin`
-
-`internal/testutil/fakebin` is a small Go program that `TestMain` builds once into a
-temp dir and symlinks as `makemkvcon`, `abcde`, `ddrescue`, `cdparanoia`, `eject`,
-`sdparm`, `curl`. Behaviour is driven by a scenario dir (`FAKEBIN_DIR`):
-
-- appends `{"tool":…, "args":[…]}` to `calls.jsonl`;
-- prints `<tool>.stdout`, exits with `<tool>.exit` (default 0);
-- simulates side effects, e.g. `makemkvcon mkv … <dir>` writes `title_t00.mkv`,
-  `ddrescue <dev> <iso>` writes the ISO, `abcde` writes `Artist-Album/01.Track.flac`.
-
-`PATH` is prepended with the fakebin dir, so `proc.Exec` runs real processes, with
-real exit codes, context cancellation and output teeing. User hooks are tested
-with real tiny shell scripts in `testdata/hooks/`.
-
-### 7.3 Parity — legacy script vs. Go binary
-
-`test/parity` runs every scenario twice inside a throwaway container (root, writable
-`/config`, `/ripper`, `/out`, so neither side is patched):
-
-1. the **legacy** `ripper.sh` from the `archive` branch (vendored read-only into
-   `test/parity/legacy/`), with fakebin on `PATH` and a fake `sleep` that stops the loop
-   after N iterations;
-2. the **Go** binary, with the same fakebin and the same `FAKEBIN_DIR`.
-
-It then compares, after normalising timestamps:
-
-- the external-tool call log (`calls.jsonl`; a legacy `curl` to Pushover and a Go HTTP
-  call to a local fake Pushover server both map to a `notify` event);
-- the resulting `/out` tree (paths, ownership, mode bits).
-
-Expected differences are declared per scenario in `test/parity/scenarios.go`, keyed to
-D1–D13, so every deviation is explicit and reviewed. Scenarios: each fixture ×
-{default, `JUSTMAKEISO`, `ALSOMAKEISO`, `SEPARATERAWFINISH`, `TIMESTAMPPREFIX`,
-`EJECTENABLED=false`, each hook present, eject-failure fallback, Pushover on/off,
-bad-response threshold}.
-
-This answers "a way to call the scripts we can test against": the legacy scripts become
-an executable spec, and the Go code must match it or document why not.
-
-### 7.4 Hardware — opt-in
-
-`//go:build hardware` tests, run with `RIPPER_TEST_DRIVE=/dev/sr0 go test -tags hardware ./...`
-on a machine with a drive: detection per inserted disc, eject, a short ISO read. Also used
-to (re)capture fixtures. Never in CI.
-
-## 8. CI
-
-New `.github/workflows/ci.yml` on PRs and pushes:
-
-1. `gofmt -l` empty, `go vet`, `staticcheck`, `govulncheck`
-2. `go test -race -shuffle=on ./...`
-3. parity suite (Docker)
-4. `docker build` of both Dockerfiles with no push, plus a smoke test
-
-`BuildImages.yml` publishes only from `main` after CI passes.
-
-## 9. Open questions (need your decision)
-
-- **Q1 — Hardware fixtures.** I can't capture real `makemkvcon` output here. Can you run
-  `scripts/capture-fixtures.sh` (phase 0) with each disc type? Until then, fixtures are
-  synthesised from the robot-mode format and marked `synthetic`.
-- **Q2 — `/config/ripper.sh` customisation (D12).** Recommended: hooks only, plus a
-  startup warning. Alternative: keep a `LEGACY_SCRIPT=true` escape hatch that execs the
-  old script (costs keeping bash + python in the image, so I'd rather not).
-- **Q3 — Registry.** Workflows push to `rix1337/docker-ripper` on Docker Hub with upstream
-  secrets. Publish this fork to `ghcr.io/jacaudi/docker-ripper` instead?
-- **Q4 — Web env names.** Keep `PREFIX`/`USER`/`PASS` (compose) only, or also accept the
-  README's `OPTIONAL_WEB_UI_*` names? `USER` clashes with the standard shell variable.
-  Recommended: accept both and warn on the short names.
-- **Q5 — Upstream.** Is this fork meant to diverge permanently, or should changes stay
-  upstreamable to `rix1337/docker-ripper`? That affects how big each PR should be.
+### 9.4 Hardware (opt-in)
+`go test -tags hardware ./...` with `RIPPER_TEST_DRIVE=/dev/sr0`: detection per inserted
+disc, eject, a short ISO read. Gates the phase 6 backends. Never runs in CI.
 
 ## 10. Repository admin (manual)
 
-Protecting `archive` (Settings → Rules → Rulesets → New branch ruleset):
-target `archive`; enable *Restrict deletions*, *Block force pushes*, *Restrict updates*
-(no bypass, or bypass for admins only). Rulesets and classic branch protection are
-available on public repos on any plan; private repos need GitHub Pro/Team or higher.
+- Protect `archive`: Settings → Rules → Rulesets → New branch ruleset → target `archive`;
+  enable *Restrict deletions*, *Block force pushes*, *Restrict updates*.
+- Enable GitHub Packages for ghcr publishing (workflow `permissions: packages: write`).
+
+## 11. Remaining open points
+
+- **Hook scripts**: assumed to stay (D12 only drops `ripper.sh`). Confirm.
+- **apprise-go maturity**: pre-1.0 and not every target is tested upstream. The seam keeps
+  it swappable; re-evaluate at phase 3.
+- **go-service-template**: its spec lives on an internal GitLab I can't reach. If the
+  layout above should mirror it, share the relevant parts.
+
+## References
+
+- go-service-kit: https://github.com/leftathome/go-service-kit
+- apprise-go: https://pkg.go.dev/github.com/unraid/apprise-go · https://unraid.net/blog/apprise-go
+- Go module layout: https://go.dev/doc/modules/layout
+- Device plugins: https://github.com/squat/generic-device-plugin/issues/62 ·
+  https://docs.siderolabs.com/kubernetes-guides/advanced-guides/device-plugins.md
+- Docker signals / grace period: https://oneuptime.com/blog/post/2026-01-16-docker-graceful-shutdown-signals/view ·
+  https://www.netdata.cloud/guides/docker/docker-exit-code-143/
