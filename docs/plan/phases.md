@@ -84,7 +84,7 @@ Pinned versions (Renovate keeps them current afterwards):
 - Files: every `.txt` listed in T§2.
 - Done when: the files exist (they are used in P2.2).
 
-**P0.5 CI and security workflows**
+**P0.5 CI and security workflows** (the repo starts with **no** workflows; the inherited upstream ones were removed in PR #1)
 - Files: `.github/workflows/ci.yml` (jobs `pr-title`, `go`), `.github/workflows/security.yml`.
 - Do: L§3, L§7. CodeQL `go` now; `javascript-typescript` is added in P3.3.
 - Done when: the PR is green, and CodeQL/OSV/Scorecard results appear under Security → Code scanning.
@@ -492,8 +492,6 @@ CMD ["serve"]
 - `release.yml`: add the `publish` job (L§5). Build natively per architecture (`ubuntu-latest` for
   amd64, `ubuntu-24.04-arm` for arm64; no QEMU, because the MakeMKV/ffmpeg build is slow under
   emulation), push by digest, then merge with `docker buildx imagetools create`.
-- Delete `BuildImages.yml`, `IssueModerator.yml`, `LabelSponsors.yml`, `UpdateOnBaseImageChange.yml`
-  and `ManualBuildOnBetaRelease.yml`.
 - This PR's title: `feat!: replace the bash/python implementation with the Go ripper`, with a
   `BREAKING CHANGE:` footer linking the migration notes.
 

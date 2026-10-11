@@ -54,7 +54,7 @@ Out of scope: new output formats (audio is FLAC and/or MP3; video is MakeMKV's M
 | 12 | User scripts | Removed (`/config/ripper.sh` and the per-disc hooks). |
 | 13 | Registry | `ghcr.io/jacaudi/docker-ripper`. |
 | 14 | Web settings | `RIPPER_WEB_PATH_PREFIX`, `RIPPER_WEB_USERNAME`, `RIPPER_WEB_PASSWORD`. |
-| 15 | Upstream | Diverge permanently; drop upstream-only workflows. |
+| 15 | Upstream | Diverge permanently. The upstream-only workflows are already removed (PR #1); all CI is new. |
 | 16 | Deployment | Target-agnostic binary. Docker/compose is documented; there is also a k8s example with a device plugin. |
 | 17 | API docs | Scalar 1.73.1, vendored and embedded, at `/docs` (always on). OpenAPI at `/openapi.json`. |
 | 18 | Web UI | React 19 + Ant Design 6 (Vite 8, TypeScript 5.9): a status card and a log panel, embedded. Typed client generated from huma's OpenAPI. |
