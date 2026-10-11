@@ -78,12 +78,10 @@ The pre-conversion state is frozen on the `archive` branch. Do not commit to it.
 | `latest/Dockerfile` | "PPA" image: `phusion/baseimage:noble-1.0.0` + `ppa:heyarje/makemkv-beta`. amd64 + arm64. |
 | `manual-build/Dockerfile` + `install/install.sh` | Builds MakeMKV from source (GPG-verified tarballs), adds OpenJDK 11 for BD-J. amd64 only. Remaps `nobody` to uid 99/gid 100 (unRAID). |
 | `docker-compose.yml` | Reference deployment with every env var documented. |
-| `.github/workflows/BuildImages.yml` | Builds/pushes `manual-latest`, `<makemkv-version>`, `latest`, `ppa-latest` (+ `-amd64`/`-arm64`) to Docker Hub `rix1337/docker-ripper`. |
-| `.github/workflows/ManualBuildOnBetaRelease.yml` | Every 6h: triggers manual build when a new MakeMKV version appears on the forum. |
-| `.github/workflows/UpdateOnBaseImageChange.yml` | Every 6h: triggers build when base image changes (checks `focal`, image is `noble` — stale). |
-| `.github/workflows/{IssueModerator,LabelSponsors}.yml` | Upstream issue hygiene; need upstream secrets. |
 
-There are no tests, no linters and no CI checks other than image builds.
+There are no tests, no linters and **no CI**: the inherited upstream workflows (image builds to
+upstream's Docker Hub, MakeMKV/base-image pollers, issue moderation, sponsor labels) were deleted
+because they need upstream secrets. New CI comes with the Go conversion (`docs/plan/tooling.md`).
 
 ## Runtime flow
 
@@ -222,7 +220,7 @@ Fixed paths: `/config` (state, log, overrides), `/out` (rips), `/ripper` (defaul
     the whole file every request.
 14. `install.sh` tests `$version` instead of `$MAKEMKV_VERSION`, so it always falls back
     to forum scraping.
-15. `UpdateOnBaseImageChange.yml` watches `focal`; images use `noble`. Workflows push to
+15. The upstream workflows (now deleted) watched `focal` while images used `noble`, and pushed to
     upstream's Docker Hub namespace with upstream secrets.
 
 ## Branches
@@ -232,8 +230,7 @@ Fixed paths: `/config` (state, log, overrides), `/out` (rips), `/ripper` (defaul
 - `chore/claude-md` — this file.
 - `claude/golang-conversion-plan-*` — the Go conversion plan (`docs/golang-conversion-plan.md`).
 
-Images are published to `ghcr.io/jacaudi/docker-ripper` (decided; workflows still
-point at upstream Docker Hub until phase 4, P4.3).
+Images will be published to `ghcr.io/jacaudi/docker-ripper` by the new workflows (Go conversion, P4.3).
 
 ## Working in this repo
 
